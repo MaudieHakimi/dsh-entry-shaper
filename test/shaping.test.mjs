@@ -4,11 +4,11 @@
 //      CI 里：node --test test/
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, rmSync, writeFileSync, existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { apply, applyOps, extractReasoning } from '../index.js'
+import { apply, applyOps, createOpCache, extractReasoning } from '../index.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const TMP = join(HERE, '.tmp')
@@ -444,6 +444,101 @@ test('默认不尝试 assistant/message 的表面替换（已知校验器冲突�
   emit(handlers, session, makeEvent())
   await settle()
   assert.equal(appends.length, 0, '表面替换默认关闭')
+})
+
+// ── 非纯 op 的结果缓存（保证多次出网结果逐字节一致 ⇒ 前缀稳定）──
+
+test('缓存：LLM op 同一输入只算一次', async () => {
+  caseNo += 1
+  const cachePath = join(TMP, `cache-${caseNo}.jsonl`)
+  rmSync(cachePath, { force: true })
+  let calls = 0
+  const fetchMock = async () => {
+    calls += 1
+    return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: `摘要${calls}` } }] }) }
+  }
+  const cache = createOpCache({ cache: { path: cachePath, enabled: true } }, () => {})
+  const ctx = { fetch: fetchMock, llm: { apiKey: 'k' }, cache }
+  const ops = [{ op: 'summarize' }]
+
+  const first = await applyOps('同一段工具输出', ops, ctx)
+  const second = await applyOps('同一段工具输出', ops, ctx)
+  assert.equal(first, second, '两次结果必须逐字节相同')
+  assert.equal(calls, 1, 'LLM 只应被调用一次（第二次命中缓存）')
+})
+
+test('缓存：重启后仍命中（新实例读同一个文件）', async () => {
+  caseNo += 1
+  const cachePath = join(TMP, `cache-${caseNo}.jsonl`)
+  rmSync(cachePath, { force: true })
+  let calls = 0
+  const fetchMock = async () => {
+    calls += 1
+    return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: '重启前的摘要' } }] }) }
+  }
+  const ops = [{ op: 'summarize', prompt: '压成要点' }]
+
+  const before = await applyOps('某段很长很长的内容', ops, {
+    fetch: fetchMock, llm: { apiKey: 'k' }, cache: createOpCache({ cache: { path: cachePath, enabled: true } }, () => {}),
+  })
+  // 模拟重启：全新实例、同一个缓存文件
+  const after = await applyOps('某段很长很长的内容', ops, {
+    fetch: fetchMock, llm: { apiKey: 'k' }, cache: createOpCache({ cache: { path: cachePath, enabled: true } }, () => {}),
+  })
+  assert.equal(after, before, '重启后必须拿到同一份摘要（否则前缀会被打断）')
+  assert.equal(calls, 1, '重启后不应再次调用 LLM')
+})
+
+test('缓存：配置变了（prompt/model）自动失效', async () => {
+  caseNo += 1
+  const cachePath = join(TMP, `cache-${caseNo}.jsonl`)
+  rmSync(cachePath, { force: true })
+  let calls = 0
+  const fetchMock = async () => {
+    calls += 1
+    return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: `v${calls}` } }] }) }
+  }
+  const cache = createOpCache({ cache: { path: cachePath, enabled: true } }, () => {})
+  const ctx = { fetch: fetchMock, llm: { apiKey: 'k', model: 'm1' }, cache }
+  await applyOps('同样的输入', [{ op: 'summarize', prompt: '提示词 A' }], ctx)
+  await applyOps('同样的输入', [{ op: 'summarize', prompt: '提示词 B' }], ctx)
+  await applyOps('同样的输入', [{ op: 'summarize', prompt: '提示词 A' }], { ...ctx, llm: { apiKey: 'k', model: 'm2' } })
+  assert.equal(calls, 3, '提示词/模型不同 ⇒ 各算一次')
+  const again = await applyOps('同样的输入', [{ op: 'summarize', prompt: '提示词 A' }], ctx)
+  assert.equal(again, 'v1', '同配置再跑应命中最早的缓存')
+  assert.equal(calls, 3)
+})
+
+test('缓存：纯 op 不进缓存（不产生缓存文件）', async () => {
+  caseNo += 1
+  const cachePath = join(TMP, `cache-${caseNo}.jsonl`)
+  rmSync(cachePath, { force: true })
+  const cache = createOpCache({ cache: { path: cachePath, enabled: true } }, () => {})
+  await applyOps('hello world', [{ op: 'stub' }], { cache })
+  assert.equal(existsSync(cachePath), false, '纯 op 不该产生缓存文件')
+})
+
+test('缓存：关闭后每次都调用', async () => {
+  caseNo += 1
+  let calls = 0
+  const fetchMock = async () => {
+    calls += 1
+    return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: 'x' } }] }) }
+  }
+  const cache = createOpCache({ cache: { enabled: false, path: join(TMP, 'unused.jsonl') } }, () => {})
+  const ctx = { fetch: fetchMock, llm: { apiKey: 'k' }, cache }
+  await applyOps('同一段内容', [{ op: 'summarize' }], ctx)
+  await applyOps('同一段内容', [{ op: 'summarize' }], ctx)
+  assert.equal(calls, 2, '关闭缓存 ⇒ 每次都真调用')
+})
+
+test('缓存：坏行被忽略，不影响会话', async () => {
+  caseNo += 1
+  const cachePath = join(TMP, `cache-${caseNo}.jsonl`)
+  rmSync(cachePath, { force: true })
+  writeFileSync(cachePath, 'not json at all\n{"k":"abc"}\n', 'utf8')
+  const cache = createOpCache({ cache: { path: cachePath, enabled: true } }, () => {})
+  assert.equal(cache.get('abc'), undefined, '坏行/不完整记录直接忽略')
 })
 
 test('非 assistant/message 事件被跳过', async () => {

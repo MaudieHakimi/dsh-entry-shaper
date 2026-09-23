@@ -23,7 +23,8 @@
 //   * 免重启熔断：存在 ~/.dsh-entry-shaper.OFF 即停手；也可在 patch 里 enabled: false
 //   * 绝不抛错进事件派发链（全部 try/catch）
 
-import { appendFileSync, existsSync } from 'node:fs'
+import { appendFileSync, existsSync, readFileSync, renameSync, statSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
@@ -31,6 +32,88 @@ export const name = 'dsh-entry-shaper'
 
 const DEFAULT_LOG = join(homedir(), '.dsh-entry-shaper.log')
 const DEFAULT_OFF = join(homedir(), '.dsh-entry-shaper.OFF')
+const DEFAULT_CACHE = join(homedir(), '.dsh-entry-shaper.cache.jsonl')
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 结果缓存：让"非纯 op"（LLM / 外部脚本）在**多次出网之间**产出逐字节相同的结果。
+//
+// 为什么必须有它：wire 级塑形对同一条旧消息**每次请求都会重算**，而 LLM 输出不保证
+// 可复现（temperature 0 也不保证：批处理、MoE 路由、服务端版本、并发都会变）。
+// 一旦重算结果不同 ⇒ payload 前缀改变 ⇒ 缓存全灭、付断点税（一次几毛）。
+//
+// 键 = sha256(生效配置指纹 + op 参数 + 输入文本) ⇒ 改了 prompt/model/端点自动失效；
+// 值 = 该次塑形结果。append-only JSONL（崩溃安全、可直接查看），启动时全量读进内存。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** 只对"非纯"op 启用缓存；纯 op 本来可复现，缓存只会白占磁盘。 */
+const CACHED_OPS = new Set(['summarize', 'python'])
+
+/** 生效配置指纹：任何会改变输出的配置都必须进这个串。 */
+function effectiveFingerprint(op, ctx) {
+  return JSON.stringify({
+    baseURL: op.baseURL ?? ctx.llm?.baseURL ?? 'https://api.deepseek.com',
+    model: op.model ?? ctx.llm?.model ?? 'deepseek-flash',
+    prompt: op.prompt ?? '<default>',
+    maxTokens: op.maxTokens ?? 256,
+    script: op.script,
+    command: op.command,
+    args: op.args,
+  })
+}
+
+export function createOpCache(cfg, log) {
+  const enabled = cfg.cache?.enabled !== false
+  const path = cfg.cache?.path ?? DEFAULT_CACHE
+  const maxBytes = cfg.cache?.maxBytes ?? 8 * 1024 * 1024
+  const maxEntryChars = cfg.cache?.maxEntryChars ?? 16384
+  const map = new Map()
+  const stats = { hits: 0, misses: 0, stores: 0 }
+
+  if (enabled) {
+    try {
+      const text = readFileSync(path, 'utf8')
+      for (const line of text.split('\n')) {
+        if (line === '') continue
+        try {
+          const rec = JSON.parse(line)
+          if (typeof rec?.k === 'string' && typeof rec?.v === 'string') map.set(rec.k, rec.v)
+        } catch { /* 坏行忽略（fail-open） */ }
+      }
+      if (map.size > 0) log(`cache loaded entries=${map.size} path=${path}`)
+    } catch { /* 首次运行没有缓存文件，正常 */ }
+  }
+
+  return {
+    enabled,
+    stats,
+    path,
+    keyOf: (op, text, ctx) => createHash('sha256')
+      .update(`${op.op}\u0000${effectiveFingerprint(op, ctx)}\u0000${JSON.stringify({ ...op, apiKey: undefined })}\u0000${text}`)
+      .digest('hex'),
+    get(key) {
+      if (!enabled) return undefined
+      const hit = map.get(key)
+      if (hit === undefined) { stats.misses += 1; return undefined }
+      stats.hits += 1
+      return hit
+    },
+    put(key, value) {
+      if (!enabled || typeof value !== 'string' || value.length > maxEntryChars) return
+      map.set(key, value)
+      stats.stores += 1
+      try {
+        appendFileSync(path, `${JSON.stringify({ k: key, v: value, t: Date.now() })}\n`, 'utf8')
+        const size = statSync(path).size
+        if (size > maxBytes) {
+          renameSync(path, `${path}.1`)
+          log(`cache rotated at ${size} bytes → ${path}.1（旧缓存留一份；内存里仍生效）`)
+        }
+      } catch (error) {
+        log(`cache write failed: ${error?.message ?? error}（不影响会话）`)
+      }
+    },
+  }
+}
 
 const DEFAULTS = {
   enabled: true,
@@ -47,6 +130,14 @@ const DEFAULTS = {
   },
   // 兼容旧配置：reasoningMode 仍可用，会被折算成 policy.reasoning.ops（显式 policy 优先）
   reasoningMode: undefined,
+  // 非纯 op（summarize / python）的结果缓存：保证同一输入在多次出网之间结果一致
+  // （否则重算结果一变，payload 前缀改变 ⇒ 断点税）。纯 op 不进缓存。
+  cache: {
+    enabled: true,
+    path: DEFAULT_CACHE,
+    maxBytes: 8 * 1024 * 1024,
+    maxEntryChars: 16384,
+  },
   stubTemplate: '[reasoning omitted: {chars} chars]',
   dropUsageOnReplace: true,
   logStats: true,
@@ -218,7 +309,21 @@ export async function applyOps(text, ops, ctx = {}) {
     if (typeof fn !== 'function') continue // 未知 op 跳过（fail-open）
     try {
       const timeout = op.timeoutMs ?? ctx.opTimeoutMs ?? 8000
-      out = await withTimeout(Promise.resolve(fn(out, op, ctx)), timeout)
+      // 非纯 op（LLM / 外部脚本）：先查缓存，命中就复用 ⇒ 同一条输入在多次出网之间
+      // 得到逐字节相同的结果 ⇒ 前缀稳定（这是 wire 级塑形能"零税"的前提）。
+      const useCache = Boolean(ctx.cache?.enabled) && CACHED_OPS.has(op.op) && op.cache !== false && typeof out === 'string'
+      const key = useCache ? ctx.cache.keyOf(op, out, ctx) : null
+      if (useCache) {
+        const hit = ctx.cache.get(key)
+        if (hit !== undefined) {
+          ctx.log?.(`op ${op.op} 缓存命中（${hit.length} 字符）`)
+          out = hit
+          continue
+        }
+      }
+      const produced = await withTimeout(Promise.resolve(fn(out, op, ctx)), timeout)
+      if (useCache && typeof produced === 'string') ctx.cache.put(key, produced)
+      out = produced
       if (out === null || out === undefined) return null
     } catch (error) {
       ctx.log?.(`op ${op?.op} 失败，跳过：${error?.message ?? error}`)
@@ -290,6 +395,7 @@ export function apply(ctx, config = {}) {
   )
 
   /** 交给 op 的上下文：可注入 fetch/spawn（便于测试），LLM 凭据与脱敏也走这里。 */
+  const opCache = createOpCache(cfg, log)
   const baseOpCtx = {
     stubTemplate: cfg.stubTemplate,
     opTimeoutMs: cfg.opTimeoutMs ?? 8000,
@@ -297,6 +403,7 @@ export function apply(ctx, config = {}) {
     fetch: cfg.fetch,
     spawn: cfg.spawn,
     redact: cfg.redact,
+    cache: opCache,
     log,
   }
 

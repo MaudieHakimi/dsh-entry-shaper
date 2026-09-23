@@ -76,6 +76,29 @@ reasoning: { ops: [{ op: python, script: "D:/shaper/my_shaper.py", protocol: jso
 reasoning: { ops: [{ op: summarize, prompt: "压成 3 行要点，保留路径与数字。", maxTokens: 200 }] }
 ```
 
+### 非纯 op 的结果缓存（`summarize` / `python`）
+
+纯 op（`extract`/`stub`/`truncate`…）是**纯函数** ⇒ 同一输入必然同一输出，前缀天然稳定 ✓。
+但 LLM / 外部脚本**不保证可复现**（temperature 0 也不保证：批处理、MoE 路由、服务端版本、并发都可能变）——
+同一条旧消息两次出网算出不同结果，**payload 前缀就会改变 ⇒ 付断点税**（一次几毛）。
+
+所以非纯 op 的结果会被缓存，键 = `sha256(生效配置指纹 + op 参数 + 输入文本)`：
+
+```yaml
+        cache:
+          enabled: true                                  # 默认开
+          path: ~/.dsh-entry-shaper.cache.jsonl          # append-only JSONL，可直接查看
+          maxBytes: 8388608                              # 超过就轮转成 .1（旧缓存留一份）
+          maxEntryChars: 16384                           # 单条超过就不缓存
+```
+
+| 性质 | 行为 |
+|---|---|
+| 改 prompt / model / 端点 | 键变化 ⇒ **自动失效** ✓（不会拿旧摘要冒充新配置） |
+| 重启 DSH | **仍命中** ✓（启动时把 JSONL 读进内存）⇒ 重启不打断前缀 ✓ |
+| 存了什么 | 只存**摘要**，不存原文 ✓；不想要就 `cache.enabled: false`（代价：每次出网都真调用） |
+| 磁盘 | 8 MB 上限 + 轮转；实测一条摘要几百字节 ⇒ 可忽略 ✓ |
+
 ## 栈约束（为什么不会把前缀打崩）
 
 会话是只进不出的栈，本插件**只处理刚追加的那一个元素**，并且有四道代码级护栏：
