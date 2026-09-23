@@ -3,3 +3,6 @@ test/.tmp/
 *.log
 *.OFF
 .DS_Store
+
+# 基准产物（临时输出，不入库）
+bench-out*.txt
