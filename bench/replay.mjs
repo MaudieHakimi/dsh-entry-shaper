@@ -171,7 +171,15 @@ if (DRY) {
   }
   const last = rows.at(-1)
   const saved = 1 - last.stubChars / last.fullChars
-  if (JSON_OUT) { console.log(JSON.stringify({ rounds: rows.length, rows }, null, 2)); process.exit(0) }
+  // 字符→token 换算：用本会话 reasoning 的实测系数（provider 自报 reasoningTokens / 文本字符数）
+  const CHAR_TO_TOKEN = Number(arg('char-to-token', '0.2666'))
+  const savedChars = rows.reduce((a, r) => a + (r.fullChars - r.stubChars), 0)
+  const savedTokens = Math.round(savedChars * CHAR_TO_TOKEN)
+  const savedMoney = savedTokens * PRICE_HIT // 省下的是**命中价**的 token
+  if (JSON_OUT) {
+    console.log(JSON.stringify({ rounds: rows.length, rows, savedChars, savedTokens, savedMoney, charToToken: CHAR_TO_TOKEN }, null, 2))
+    process.exit(0)
+  }
   console.log(`\n=== 固定轨迹重放（离线模式，不打 API）===`)
   console.log(`剧本：turn=${script[0].turn} 内连续 ${script.length} 轮工具调用（来自 ${file.split(/[\\/]/).pop()}）`)
   console.log(`\n轮次  payload 字符（full → stub）        省`)
@@ -179,7 +187,10 @@ if (DRY) {
     console.log(`  ${String(r.round).padStart(2)}   ${r.fullChars.toLocaleString().padStart(9)} → ${r.stubChars.toLocaleString().padStart(9)}   ${((1 - r.stubChars / r.fullChars) * 100).toFixed(1)}%`)
   }
   console.log(`\n末轮 payload：${last.fullChars.toLocaleString()} → ${last.stubChars.toLocaleString()} 字符（省 ${(saved * 100).toFixed(1)}%）`)
-  console.log('注意：字符≠token，但同轨迹下比例稳定；要钱数请去掉 --dry 跑真实请求。')
+  console.log(`整段剧本累计少发：${savedChars.toLocaleString()} 字符 ≈ ${savedTokens.toLocaleString()} token`)
+  console.log(`这些 token 是**命中价**的 ⇒ 省 ≈ $${savedMoney.toFixed(5)}（按 $0.02/M；换算系数 ${CHAR_TO_TOKEN}，可用 --char-to-token 覆盖）`)
+  console.log('\n⚠️ 只算"少发的 token × 命中价"，因为固定轨迹下两臂的**新增内容相同**（未命中应相等）。')
+  console.log('⚠️ 在线 A/B 实测成本不可信：provider 缓存在多次运行间被复用，第二次跑的臂几乎全命中（见 CHANGELOG）。')
   process.exit(0)
 }
 
