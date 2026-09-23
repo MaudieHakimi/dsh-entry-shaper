@@ -668,6 +668,35 @@ test('插件启动：proxy.enabled 时注册代理 provider；拿不到 llm 服�
   assert.doesNotThrow(() => apply(noLlmCtx, { logPath: join(TMP, 'proxy-nollm.log'), offSentinel: join(TMP, 'no.OFF'), proxy: { enabled: true } }))
 })
 
+test('热配置：改配置文件无需重启即生效（按 mtime 热读）', async () => {
+  caseNo += 1
+  const cfgPath = join(TMP, `hot-${caseNo}.json`)
+  const logPath = join(TMP, `hot-${caseNo}.log`)
+  rmSync(cfgPath, { force: true })
+  writeFileSync(cfgPath, JSON.stringify({ enabled: false }), 'utf8')
+
+  const listeners = []
+  const ctx = { on: (n, h) => { listeners.push({ n, h }); return () => {} } }
+  apply(ctx, { logPath, offSentinel: join(TMP, 'no.OFF'), configPath: cfgPath })
+  const mw = listeners.find((l) => l.n === 'llm/stream').h
+  const chunks = [{ type: 'reasoning', text: 'FULL' }, { type: 'text', text: 'x' }]
+  const run = async () => {
+    const out = []
+    const src = (async function* () { for (const c of chunks) yield c })()
+    for await (const c of mw({}, () => src)) out.push(c)
+    return out
+  }
+
+  // enabled:false ⇒ 原样透传
+  assert.equal((await run())[0].text, 'FULL', '配置里 enabled:false ⇒ 不塑形')
+
+  // 改配置文件（模拟用户编辑；mtime 变化即可，不要重启）
+  await new Promise((r) => setTimeout(r, 20))
+  writeFileSync(cfgPath, JSON.stringify({ enabled: true, policy: { reasoning: { ops: [{ op: 'stub' }] } } }), 'utf8')
+  const after = await run()
+  assert.equal(after[0].text, '[reasoning omitted: 4 chars]', '热改配置后立即按新策略执行 ✓')
+})
+
 test('非 assistant/message 事件被跳过', async () => {
   const { handlers, appends, session } = setup()
   emit(handlers, session, makeEvent({ type: 'tool/result' }))

@@ -33,6 +33,9 @@ export const name = 'dsh-entry-shaper'
 const DEFAULT_LOG = join(homedir(), '.dsh-entry-shaper.log')
 const DEFAULT_OFF = join(homedir(), '.dsh-entry-shaper.OFF')
 const DEFAULT_CACHE = join(homedir(), '.dsh-entry-shaper.cache.jsonl')
+// 热配置：patch 里**不能**放 config（dshmarket 的 hot.js:295 明确：含配置行的 patch
+// 无法热挂载，只能重启生效）⇒ 所有可调项放这个文件，运行时按 mtime 热读。
+const DEFAULT_CONFIG = join(homedir(), '.dsh-entry-shaper.config.json')
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 结果缓存：让"非纯 op"（LLM / 外部脚本）在**多次出网之间**产出逐字节相同的结果。
@@ -459,11 +462,12 @@ export async function shapeMessages(messages, policy, ctx = {}) {
  * @param opts - { llm, upstream, policy, ctx }
  * @returns LlmAdapter 形状的对象（仅 runtime 需要的成员）
  */
-export function createProxyAdapter({ llm, upstream, policy, ctx, shouldShape = () => true }) {
+export function createProxyAdapter({ llm, upstream, policy, getPolicy, ctx, shouldShape = () => true }) {
+  const policyNow = () => (typeof getPolicy === 'function' ? getPolicy() : (policy ?? {}))
   const proxyStream = async function* proxyStream(options) {
     // 急刹与总闸在这里也要生效：不塑形就**原样转发**（而不是拒绝请求），
     // 这样哨兵一建就立刻回到"没装插件"的行为，且不会打断任何正在进行的调用。
-    const messages = shouldShape() ? await shapeMessages(options?.messages, policy, ctx) : options?.messages
+    const messages = shouldShape() ? await shapeMessages(options?.messages, policyNow(), ctx) : options?.messages
     const inner = llm.stream({ ...options, provider: upstream, messages })
     for await (const chunk of inner) yield chunk
   }
@@ -493,8 +497,28 @@ export function createProxyAdapter({ llm, upstream, policy, ctx, shouldShape = (
 }
 
 export function apply(ctx, config = {}) {
-  const cfg = { ...DEFAULTS, ...(config ?? {}) }
-  const LOG = cfg.logPath
+  let cfg = { ...DEFAULTS, ...(config ?? {}) }
+  const CONFIG_PATH = cfg.configPath ?? DEFAULT_CONFIG
+  let configStamp = -1
+
+  /**
+   * 热读配置：**patch 里不能带 config**（`dshmarket/lib/hot.js:295`：含配置行的 patch
+   * 无法热挂载，只能重启生效 ⇒ 那会让本插件永远不可热插拔 ✗）。所以所有可调项放在
+   * 这个 JSON 文件里，运行时按 mtime 检查、变了就重新合并 ⇒ 改配置**不需要重启** ✓，
+   * 同时 patch 保持"纯 insert" ⇒ 可以被市场/`dsh plugin add` 热挂载 ✓。
+   */
+  const refreshCfg = () => {
+    try {
+      const st = statSync(CONFIG_PATH)
+      if (st.mtimeMs === configStamp) return
+      configStamp = st.mtimeMs
+      const hot = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'))
+      cfg = { ...DEFAULTS, ...(config ?? {}), ...hot, configPath: CONFIG_PATH }
+      try { log(`配置热更新 ${CONFIG_PATH}（mtime=${new Date(st.mtimeMs).toISOString()}）`) } catch { /* 日志失败忽略 */ }
+    } catch { /* 文件不存在或坏 JSON ⇒ 沿用当前配置（fail-open） */ }
+  }
+  refreshCfg()
+
   const OFF = cfg.offSentinel
   const stats = { events: 0, stripped: 0, blocks: 0, chars: 0, emptyFixed: 0, failed: 0, offSkips: 0 }
   const started = Date.now()
@@ -502,14 +526,14 @@ export function apply(ctx, config = {}) {
   const log = (line) => {
     if (!cfg.logStats) return
     try {
-      appendFileSync(LOG, `${new Date().toISOString()} ${line}\n`, 'utf8')
+      appendFileSync(cfg.logPath ?? DEFAULT_LOG, `${new Date().toISOString()} ${line}\n`, 'utf8')
     } catch { /* 日志失败不影响会话 */ }
   }
 
   log(
     `applied pid=${process.pid} enabled=${cfg.enabled} dropReasoning=${cfg.dropReasoning}`
     + ` policy=${Object.entries(cfg.policy ?? {}).map(([k, v]) => `${k}:${(v?.ops ?? []).map((o) => o?.op).join('→') || 'keep'}`).join(',')}`
-    + ` log=${LOG} off=${existsSync(OFF)}`,
+    + ` log=${cfg.logPath ?? DEFAULT_LOG} off=${existsSync(OFF)} config=${CONFIG_PATH}`,
   )
 
   /** 交给 op 的上下文：可注入 fetch/spawn（便于测试），LLM 凭据与脱敏也走这里。 */
@@ -548,6 +572,7 @@ export function apply(ctx, config = {}) {
         const alias = cfg.proxy.provider ?? 'deepseek-shaped'
         const upstream = cfg.proxy.upstream ?? 'deepseek-official'
         const shouldShape = () => {
+          refreshCfg()
           const off = existsSync(OFF)
           if (off && !stats.proxyOffNoted) {
             stats.proxyOffNoted = true
@@ -555,7 +580,13 @@ export function apply(ctx, config = {}) {
           }
           return cfg.enabled && cfg.dropReasoning && !off
         }
-        const adapter = createProxyAdapter({ llm, upstream, policy: resolvePolicy(), ctx: baseOpCtx, shouldShape })
+        const adapter = createProxyAdapter({
+          llm,
+          upstream,
+          getPolicy: resolvePolicy,   // 每次调用现算 ⇒ 配置热改立刻生效 ✓
+          ctx: baseOpCtx,
+          shouldShape,
+        })
         llm.registerAdapter([alias], adapter)
         log(`proxy registered provider=${alias} upstream=${upstream}`
           + '（把 agent-default-model.provider 换成它即生效；日志与界面仍保留原文）')
@@ -583,6 +614,7 @@ export function apply(ctx, config = {}) {
   const reasoningOps = () => resolvePolicy().reasoning?.ops ?? []
 
   const shapeReasoningStream = (options, next) => {
+    refreshCfg()
     if (!cfg.enabled || !cfg.dropReasoning) return next(options)
     // 急刹（哨兵）对流过滤同样要生效 —— 之前只在表面事件那条路检查，是个缺口。
     if (existsSync(OFF)) return next(options)
@@ -649,6 +681,7 @@ export function apply(ctx, config = {}) {
 
   async function handleEvent(session, event) {
     {
+      refreshCfg()
       if (!cfg.enabled || !cfg.dropReasoning) return
       stats.events += 1
 

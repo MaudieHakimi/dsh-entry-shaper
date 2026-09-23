@@ -1,77 +1,34 @@
-# dsh-entry-shaper bundle patch：把插件行插入宿主插件树
-# 本插件**不接管 compaction 服务**（因此不需要 disable 任何官方行），可与官方
-# dsh-compaction-basic、dsh-context-slimmer 共存。
+# dsh-entry-shaper bundle patch
+#
+# ⚠️ **本文件必须保持"纯 insert"**：`dshmarket/lib/hot.js:295` 明确规定
+#    「bundle patch 含配置行/表达式 ⇒ 不能热挂载，只能重启生效」。
+#    所以这里**不能写 config:**（否则本插件永远无法被市场/`dsh plugin add` 热挂载 ✗）。
+#
+# 可调项全部放在**运行时热读**的配置文件里（改完立即生效，不需要重启）：
+#    ~/.dsh-entry-shaper.config.json   ← 内容与下面的示例同形
+# 三个开关层次：
+#    ① 本 patch 的 insert（是否挂载；改它需重启 ✗）
+#    ② 用户层 `- id: dsh-entry-shaper / disabled: true|false`（最后应用；改它需重启 ✗）
+#    ③ 运行时可热改：配置文件（enabled / policy / proxy / cache / opTimeoutMs …）✓
+#       以及免重启急刹：在用户主目录建空文件 ~/.dsh-entry-shaper.OFF ✓
+#
+# ~/.dsh-entry-shaper.config.json 示例：
+# {
+#   "enabled": true,
+#   "dropReasoning": true,
+#   "policy": {
+#     "reasoning":  { "ops": [{ "op": "extract", "maxChars": 240 }] },
+#     "toolResult": { "ops": [{ "op": "keep" }] },
+#     "toolArgs":   { "ops": [{ "op": "keep" }] },
+#     "assistantText": { "ops": [{ "op": "keep" }] }
+#   },
+#   "cache": { "enabled": true, "maxBytes": 8388608, "maxEntryChars": 16384 },
+#   "proxy": { "enabled": false, "provider": "deepseek-shaped", "upstream": "deepseek-official" },
+#   "opTimeoutMs": 8000,
+#   "lagWarnMs": 2000
+# }
+#
+# 本插件不接管任何服务（不 provide），因此**不需要** disable 别的行 ✓。
 - insert:
     - id: dsh-entry-shaper
       name: dsh-entry-shaper
-      config:
-        # 总开关。**注意**：profile 用户层（profiles/<name>/cordis.patch.yml）里若还有
-        #   - id: dsh-entry-shaper
-        #     disabled: true
-        # 那一行会覆盖这里（用户层最后应用）—— 两处都开才生效。
-        enabled: true
-        # 是否处理 reasoning（总闸）
-        dropReasoning: true
-
-        # ── 处理层：按内容类别各给一条 op 序列（文本 → 文本 的纯函数链，可异步）──
-        # 可用 op：keep | drop | stub | extract | head | tail | truncate | python | summarize
-        #   * reasoning **永远不会被整块删除**：drop 对它无效，内核会退回短桩
-        #     （thinking 模式下"延续工具回路"时缺 reasoning_content 会被 API 400）。
-        #   * 未知 op 跳过；任何 op 抛错/超时都只跳过它自己（fail-open）。
-        policy:
-          reasoning:      { ops: [{ op: extract, maxChars: 240 }] }
-          toolResult:     { ops: [{ op: keep }] }
-          toolArgs:       { ops: [{ op: keep }] }
-          assistantText:  { ops: [{ op: keep }] }
-
-          # 想开"工具结果首尾桩"就这样写：
-          # toolResult:   { ops: [{ op: truncate, maxChars: 1024 }] }
-
-          # Python 接口：stdin 收一行 JSON {"text":...,"kind":...}，
-          # stdout 回 {"text":...} 或纯文本；退出码非 0 / 超时 / 空输出 ⇒ 跳过该 op。
-          # reasoning:    { ops: [{ op: python, script: "D:/shaper/my_shaper.py", protocol: json }] }
-
-          # LLM 塑形：OpenAI 兼容 POST {baseURL}/chat/completions，显式提示词，温度 0，
-          # 出网前可过 redact；失败/超时/空返回 ⇒ 跳过该 op。
-          # reasoning:    { ops: [{ op: summarize, prompt: "压成 3 行要点，保留路径与数字。", maxTokens: 200 }] }
-
-        # summarize op 的端点与模型（apiKey 依次取 op.apiKey → llm.apiKey → DEEPSEEK_API_KEY）
-        # llm:
-        #   baseURL: https://api.deepseek.com
-        #   model: deepseek-flash
-        #   apiKey: sk-…
-
-        # op 超时护栏：LLM / 外部进程超过它就跳过，绝不挂住会话
-        opTimeoutMs: 8000
-
-        # 非纯 op（summarize / python）的结果缓存：保证同一输入在多次出网之间结果一致
-        # （否则重算一变 ⇒ payload 前缀改变 ⇒ 断点税）。纯 op 不进缓存。
-        cache:
-          enabled: true
-          path: ~/.dsh-entry-shaper.cache.jsonl
-          maxBytes: 8388608
-          maxEntryChars: 16384
-
-        # ── wire 级塑形：代理 provider（插件自足，不动 harness）──
-        # 打开后本插件注册一个新 provider，它的适配器把 messages 塑形后**转调上游**：
-        #   * 会话 / 日志 / 界面**完整保留原文** ✓（不再像流过滤那样在"出生时"就替换）
-        #   * 只有"发出去的 payload"是抽取/桩 ⇒ 前缀稳定、零断点税 ✓
-        # 用法（两步）：
-        #   ① 这里改成 enabled: true
-        #   ② 在 ~/.dsh/settings.yaml 里把 agent-default-model.provider 改成 deepseek-shaped
-        #      （model id 不用改；想还原就改回 deepseek-official）
-        # 注意：proxy 开启时流过滤会自动让路（否则内层转调会再被滤一次 ⇒ 日志又丢原文）
-        proxy:
-          enabled: false
-          provider: deepseek-shaped
-          upstream: deepseek-official
-
-        # 定型延迟告警阈值：从"事件追加"到"替换落地"的耗时超过它就写 WARN
-        # （这是"定型早于首次发送"的可观测证据；一旦告警说明时序假设可能被破坏）
-        lagWarnMs: 2000
-
-        # 替换事件不带 usage（token-meter 按事件折算 usage，复制会双计）。
-        # 若实测发现统计丢失（说明它按表面折算），改为 false。
-        dropUsageOnReplace: true
-        # 统计与自证写 ~/.dsh-entry-shaper.log
-        logStats: true
