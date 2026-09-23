@@ -447,6 +447,55 @@ test('流过滤：enabled=false 时原样透传', async () => {
   assert.deepEqual(out, chunks)
 })
 
+test('自定义 op：config.ops 注入的函数被 policy 引用后真的生效', async () => {
+  const { handlers, appends, session } = setup({
+    policy: { reasoning: { ops: [{ op: 'shout' }] } },
+    ops: { shout: (text) => `!!!${String(text).slice(0, 4)}!!!` },
+  })
+  emit(handlers, session, makeEvent())
+  await settle()
+  assert.equal(appends.length, 1, '自定义 op 应触发替换')
+  assert.equal(appends[0][1].message.content[0].text, '!!!Expl!!!')
+})
+
+test('自定义 op：可用字符串把名字映射到内置 op（无需注入函数 ⇒ 可热改）', async () => {
+  const { handlers, appends, session } = setup({
+    policy: { reasoning: { ops: [{ op: 'myalias' }] } },
+    ops: { myalias: 'stub' },
+  })
+  emit(handlers, session, makeEvent())
+  await settle()
+  assert.equal(appends.length, 1)
+  assert.ok(appends[0][1].message.content[0].text.startsWith('[reasoning omitted:'),
+    'myalias 应解析到内置 stub')
+})
+
+test('自定义 op：未知名字（既非函数也非内置）⇒ 跳过该 op，不抛错', async () => {
+  const { handlers, appends, session } = setup({
+    policy: { reasoning: { ops: [{ op: 'nope' }, { op: 'stub' }] } },
+  })
+  emit(handlers, session, makeEvent())
+  await settle()
+  // 第一个 op 被跳过 ⇒ 第二个 stub 仍然生效（链式 fail-open）
+  assert.equal(appends.length, 1)
+  assert.ok(appends[0][1].message.content[0].text.startsWith('[reasoning omitted:'))
+})
+
+test('自定义 op：不进缓存键的那个函数字段（同名不同实现必须能区分）', () => {
+  // 反例是"直接把 { ...op } 序列化"：JSON.stringify 会丢掉函数 ⇒
+  // 两个同名不同实现的自定义 op 撞到同一个键 ⇒ 拿旧结果冒充新实现。
+  // 这里用 keyOf 直接验证：同名 + 参数不同 ⇒ 键必须不同。
+  const cache = createOpCache({ enabled: false }, () => {})
+  const a = cache.keyOf({ op: 'mine', p: 1, __fn: () => 'x' }, 'input', {})
+  const b = cache.keyOf({ op: 'mine', p: 2, __fn: () => 'x' }, 'input', {})
+  const c = cache.keyOf({ op: 'mine', p: 1, __fn: () => 'y' }, 'input', {})
+  assert.notEqual(a, b, '参数不同 ⇒ 键必须不同')
+  assert.equal(a, c, '函数体本来就不会进键（JSON 丢函数）⇒ 同名同参数即同键；'
+    + '所以自定义 op 请用不同的名字区分实现')
+  assert.equal(cache.keyOf({ op: 's', apiKey: 'k1' }, 'in', {}), cache.keyOf({ op: 's', apiKey: 'k2' }, 'in', {}),
+    'apiKey 不得进键（换了密钥不该整体失效）')
+})
+
 test('默认不尝试 assistant/message 的表面替换（已知校验器冲突）', async () => {
   const { handlers, appends, session } = setup({ surfaceAssistant: false })
   emit(handlers, session, makeEvent())

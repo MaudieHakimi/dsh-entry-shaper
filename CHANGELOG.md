@@ -2,6 +2,48 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与语义化版本。
 
+## [0.9.6] — 2026-09-23
+
+**自定义算法真正可用了 + 文档补上"怎么配上去"（此前 README 只有一张名词表）。**
+
+### Added
+
+- **`config.ops`：可注入自定义 op**。此前 `ops` 表是硬编码的 `const OPS`，
+  使用者**没有任何入口**接入自己的算法，只能改源码。现在两种写法：
+  - 注入函数：`ops: { 名字: (text, op, ctx) => string|null }`（由 patch 的 `config:` 传入）；
+  - 纯字符串映射到内置 op：`ops: { myalias: "extract" }` —— **不需要注入函数**，
+    因此这条路径仍然**可以热改** ✓。
+  `applyOps()` 支持 `op.__fn`；策略解析处（`resolvePolicy()`）统一把名字解析成实现，
+  因此**导出的 `applyOps` 公开 API 不变**（仍然只认内置表）。
+- **自定义 op 也进缓存**（`cache: false` 可关）。理由：无法判断用户函数是否纯，而
+  "结果漂移 ⇒ 前缀改变 ⇒ 付断点税"比"多占几 KB 磁盘"贵得多 ⇒ **宁可多缓存**。
+- `examples/config.full.json`（一个完整可用的配置）与 `examples/custom-op.md`
+  （接入自定义算法的三种方式 + 函数契约 + 取舍表）。
+
+### Fixed
+
+- **缓存键会漏掉"同名不同实现"**：`keyOf()` 原用 `JSON.stringify({ ...op, apiKey: undefined })`，
+  而 `JSON.stringify` 会**丢掉函数** ⇒ 两个同名不同实现的自定义 op 撞到**同一个键**
+  ⇒ 拿旧实现的结果冒充新实现 ✗。现在显式剔除 `__fn`，并把"名字是唯一身份、
+  不同实现请用不同名字"写进注释与文档。
+- `README` 补上**配置片段**（7 个复制即用的 `policy` 写法）与 op 的**参数全集表**
+  （此前只有 op 名与一句语义，`maxChars` / `chars` / `protocol` / `args` 等参数名都没写）。
+
+### Docs
+
+- **写清了两处"照抄就踩坑"的地方**：
+  ① 配置文件里的路径**没有 `~` 展开**（代码用 `join(homedir(), …)`，而配置字符串原样使用）
+  ⇒ 写 `"~/.dsh-entry-shaper.log"` 会在当前目录建一个叫 `~` 的目录；
+  ② 注入函数 / `ctx.llm` / `ctx.redact` / `ctx.fetch` / `ctx.spawn` **只能从 patch 的 `config:`
+  传入** ⇒ patch 出现 `config:` 行就**失去热挂载**（`dshmarket/lib/hot.js:295`）。
+  并把"同一件事优先选不需要 `config:` 的干法"写成规则（例：`summarize` 用自己的
+  `baseURL`/`model`/`apiKey` 参数，而不是 `ctx.llm`）。
+
+### 测试 67/67
+
+新增 4 例：① `config.ops` 注入的函数经 `policy` 引用后真的生效；② 字符串别名解析到内置 op；
+③ 未知名字被跳过且链上后续 op 仍生效；④ 缓存键：同名不同参数不得同键、`apiKey` 不得进键。
+
 ## [0.9.5] — 2026-09-23
 
 **外部审计发现的真实缺陷：`ReferenceError` 静默废掉整段统计与护栏。**

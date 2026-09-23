@@ -90,9 +90,21 @@ export function createOpCache(cfg, log) {
     enabled,
     stats,
     path,
-    keyOf: (op, text, ctx) => createHash('sha256')
-      .update(`${op.op}\u0000${effectiveFingerprint(op, ctx)}\u0000${JSON.stringify({ ...op, apiKey: undefined })}\u0000${text}`)
-      .digest('hex'),
+    /**
+     * 缓存键 = 生效配置指纹 + op 参数 + 输入文本。
+     *
+     * ⚠️ 两个**必须**遵守的细节（都踩过或差点踩到）：
+     * ① `apiKey` 必须排除（否则密钥进哈希、改了密钥就整体失效）；
+     * ② `__fn`（自定义 op 的实现函数）必须显式排除 —— `JSON.stringify` 本来就会丢掉函数，
+     *    那会让"同名不同实现"的自定义 op 撞到**同一个键** ⇒ 拿旧实现的结果冒充新实现 ✗。
+     *    唯一能进键的身份是 `op` 里的**名字**，所以自定义 op 请用不同的名字区分实现。
+     */
+    keyOf: (op, text, ctx) => {
+      const { __fn: _ignoredFn, apiKey: _ignoredKey, ...params } = op ?? {}
+      return createHash('sha256')
+        .update(`${op.op}\u0000${effectiveFingerprint(op, ctx)}\u0000${JSON.stringify(params)}\u0000${text}`)
+        .digest('hex')
+    },
     get(key) {
       if (!enabled) return undefined
       const hit = map.get(key)
@@ -322,13 +334,19 @@ export async function applyOps(text, ops, ctx = {}) {
   if (!Array.isArray(ops) || ops.length === 0) return text
   let out = text
   for (const op of ops) {
-    const fn = OPS[op?.op]
+    // `op.__fn` 允许调用方注入自定义实现（插件运行时用它支持 `config.ops`）；
+    // 直接使用导出 API 时只写 `{ op: 'extract', … }` 即可，仍然查内置表。
+    const fn = typeof op?.__fn === 'function' ? op.__fn : OPS[op?.op]
     if (typeof fn !== 'function') continue // 未知 op 跳过（fail-open）
     try {
       const timeout = op.timeoutMs ?? ctx.opTimeoutMs ?? 8000
       // 非纯 op（LLM / 外部脚本）：先查缓存，命中就复用 ⇒ 同一条输入在多次出网之间
       // 得到逐字节相同的结果 ⇒ 前缀稳定（这是 wire 级塑形能"零税"的前提）。
-      const useCache = Boolean(ctx.cache?.enabled) && CACHED_OPS.has(op.op) && op.cache !== false && typeof out === 'string'
+      // 自定义 op（__fn）也走缓存 —— 我们无法判断它是否纯，**宁可多缓存**：
+      // 不缓存而结果漂移 ⇒ 前缀改变 ⇒ 付断点税（比多占几 KB 磁盘贵得多）。
+      const opName = op.__fn === undefined ? op.op : `custom:${op.op}`
+      const useCache = Boolean(ctx.cache?.enabled) && op.cache !== false && typeof out === 'string'
+        && (CACHED_OPS.has(op.op) || op.__fn !== undefined)
       const key = useCache ? ctx.cache.keyOf(op, out, ctx) : null
       if (useCache) {
         const hit = ctx.cache.get(key)
@@ -629,7 +647,15 @@ export function apply(ctx, config = {}) {
     log('配置使用了旧名 dropReasoning ⇒ 已归一为 shapeReasoning（效果相同，建议改新名）')
   }
 
-  /** 交给 op 的上下文：可注入 fetch/spawn（便于测试），LLM 凭据与脱敏也走这里。 */
+  /**
+   * 交给 op 的上下文：可注入 fetch/spawn（便于测试），LLM 凭据与脱敏也走这里。
+   *
+   * ⚠️ 注意可热配置的边界：`llm` / `redact` / `fetch` / `spawn` **只能从 patch 的
+   * `config:` 传入**（函数与凭据无法写进 JSON 配置文件）⇒ 用到 `summarize` + 自定义凭据
+   * 或脱敏时，就必须放弃"patch 纯 insert"⇒ 放弃热挂载（改回重启生效）。
+   * 只想用内置 op（含指向你自己脚本/端点的 `python` / `summarize`）则完全不必：
+   * 那些参数都在热配置文件里。
+   */
   const opCache = createOpCache(cfg, log)
   const baseOpCtx = {
     stubTemplate: cfg.stubTemplate,
@@ -642,6 +668,37 @@ export function apply(ctx, config = {}) {
     log,
   }
 
+  /**
+   * 用户注入的**自定义 op**：来自 patch config 的 `ops`（`{ 名字: (text, op, ctx) => string|null }`）。
+   * 也支持从热配置文件按**名字引用内置 op**（`"ops": { "myalias": "extract" }`）—— 那不需要
+   * 任何函数注入，纯字符串即可热改 ✓。
+   *
+   * ⚠️ **本机实测过的一个陷阱**：用 `ops` 注入函数 ⇒ patch 里必须出现 `config:` 行 ⇒
+   * `dshmarket/lib/hot.js:295` 判定为"含配置行"⇒ **不能热挂载**（只能重启生效）。
+   * 所以自定义函数的代价是"放弃热插拔"，请按需权衡；纯内置 op 的用法不受影响。
+   */
+  const customOps = { ...(cfg.ops ?? {}) }
+  /** 解析一个 op 名 → 实现函数：自定义优先，其次内置。 */
+  const resolveOpFn = (name) => {
+    const custom = customOps[name]
+    if (typeof custom === 'function') return custom
+    if (typeof custom === 'string' && typeof OPS[custom] === 'function') return OPS[custom]
+    return OPS[name]
+  }
+  /**
+   * 把策略里的 op 名换成**已解析的实现**，再交给 applyOps。
+   * 这样 `applyOps`（导出的公开 API）仍然只认内置表，而插件运行时支持自定义 op ✓。
+   */
+  const resolveOps = (ops) => (Array.isArray(ops)
+    ? ops.map((op) => {
+      const fn = resolveOpFn(op?.op)
+      return typeof fn === 'function' ? { ...op, __fn: fn } : op
+    })
+    : ops)
+  const resolvedPolicy = (policy) => Object.fromEntries(
+    Object.entries(policy).map(([kind, entry]) => [kind, { ...entry, ops: resolveOps(entry?.ops ?? []) }]),
+  )
+
   /** 策略解析（三条路径共用一处）：默认 policy + 用户 policy + legacy reasoningMode 折算。 */
   const resolvePolicy = () => {
     const policy = { ...DEFAULTS.policy, ...(cfg.policy ?? {}) }
@@ -652,7 +709,8 @@ export function apply(ctx, config = {}) {
         ? { ops: [{ op: 'stub' }] }
         : { ops: [{ op: 'extract', maxChars: cfg.extractMaxChars ?? 240 }] }
     }
-    return policy
+    // 顺手把自定义/别名 op 解析成实现（applyOps 也认 op.__fn）
+    return resolvedPolicy(policy)
   }
 
   // ── 代理 provider：wire 级塑形（可选）──

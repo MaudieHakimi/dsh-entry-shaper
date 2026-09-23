@@ -122,6 +122,11 @@ dsh plugin --profile web add "file:D:\plugins\dsh-entry-shaper"
 **打开代理只需改这里**（`proxy.enabled: true`），本插件会**惰性注册**该路由 —— 不必重挂载、
 不必重启 ✓。随后把会话或默认 provider 换成 `proxy.provider`（默认 `deepseek-shaped`）即生效。
 
+> ⚠️ **路径里不要写 `~`**。配置文件里的路径是**原样使用**的（没有 shell 展开），
+> 写 `"logPath": "~/.dsh-entry-shaper.log"` 会在当前目录下建一个名叫 `~` 的目录 ✗。
+> **省略这些键**（推荐，默认值已经是正确的绝对路径），或写绝对路径
+> （如 `"D:/logs/shaper.log"`）。
+
 ### 免重启的三个开关
 
 | 想做什么 | 怎么做 | 生效 |
@@ -147,21 +152,94 @@ dsh plugin --profile web add "file:D:\plugins\dsh-entry-shaper"
 2. 热挂载条目的 id 是 `mkt-<原id>`，与 patch 层的 `- id: <原id>` **不是同一个条目**
    ⇒ patch 层的 `disabled: true` 管不住热挂载实例。
 
-## 可用 op
+## 可用 op（参数全集）
 
-| op | 语义 |
-|---|---|
-| `keep` | 原样（默认） |
-| `drop` | 整块删除（**推理块例外**：内核会退回短桩，见下） |
-| `stub` | 换成 `stubTemplate`（默认 `[reasoning omitted: {chars} chars]`） |
-| `extract` | 只留决策句（`maxChars` 预算，默认 240） |
-| `head` / `tail` / `truncate` | 保留前 N / 后 N / 首尾 + 省略计数 |
-| `python` | 外部脚本：stdin 收 `{"text":…,"kind":…}`，stdout 回 `{"text":…}` 或纯文本 |
-| `summarize` | OpenAI 兼容 LLM（显式提示词、温度 0）；apiKey 取 `op.apiKey → llm.apiKey → DEEPSEEK_API_KEY` |
+每个 op 都是 `文本 → 文本`。`返回 null` 表示"整块删除"。**未列出的参数一律忽略**。
 
-op 可任意链式组合（`[{op: extract}, {op: truncate, maxChars: 80}]`），**可以是 async**，
-统一受 `opTimeoutMs`（默认 8s）约束：超时或抛错 ⇒ 只跳过该 op、保留上一步结果（fail-open）
-—— 最坏情况是"没省到"，绝不会挂住会话。
+| op | 参数 | 默认 | 说明 |
+|---|---|---|---|
+| `keep` | — | — | 原样返回（默认策略） |
+| `drop` | — | — | 返回 `null` ⇒ 整块删除（**推理块例外**：内核会退回短桩，见下） |
+| `stub` | — | — | 用 `ctx.stubTemplate`｜默认 `[reasoning omitted: {chars} chars]`，`{chars}` 替换为原字符数 |
+| `extract` | `maxChars`<br>`marker` | `240`<br>`true` | 只留"决策句"（以 `I'll / let me / next / 然后 / 我先…` 开头）。`marker: false` 去掉 `[reasoning extract: N chars omitted]` 前缀 |
+| `head` | `chars` | `512` | 保留**前** N 个字符 |
+| `tail` | `chars` | `512` | 保留**后** N 个字符 |
+| `truncate` | `maxChars` | `512` | 首尾各留一半、中间折叠成 `…（省略 N 字符）…` |
+| `python` | `script` **必填**<br>`command`<br>`args`<br>`protocol`<br>`timeoutMs` | —<br>`python`<br>`[]`<br>`json`<br>`8000` | 起外部进程。`protocol: json` ⇒ stdin 收一行 `{"text","kind","meta"}`，stdout 回 `{"text"}` 或纯文本；`protocol: text` ⇒ stdin 收纯文本。退出码≠0 / 超时 / 输出空 ⇒ 跳过该 op |
+| `summarize` | `prompt`<br>`baseURL`<br>`model`<br>`maxTokens`<br>`apiKey` | 内置中文提示词<br>`https://api.deepseek.com`<br>`deepseek-flash`<br>`256`<br>`DEEPSEEK_API_KEY` | `POST {baseURL}/chat/completions`，`temperature: 0` |
+
+**每个 op 还可以带**：`timeoutMs`（覆盖该 op 的超时）、`cache: false`（**非纯 op 别关** —— 见下）。
+
+### 复制即用的配置片段
+
+下面全部是 `~/.dsh-entry-shaper.config.json` 里 `policy` 的写法（改完**立即生效，不用重启**）：
+
+```jsonc
+// ① 默认：推理只留决策句（最省，也最有损）
+"reasoning": { "ops": [{ "op": "extract", "maxChars": 240 }] }
+
+// ② 保守：保留推理的真实开头（不按句式挑，模型更"接得上"）
+"reasoning": { "ops": [{ "op": "head", "chars": 800 }] }
+
+// ③ 更省：先抽取，再兜底截断（两道闸）
+"reasoning": { "ops": [{ "op": "extract", "maxChars": 400 }, { "op": "truncate", "maxChars": 300 }] }
+
+// ④ 完全不动推理（省的就只剩别的类别）
+"reasoning": { "ops": [{ "op": "keep" }] }
+
+// ⑤ 工具结果：超大输出只留首尾（注意官方 tool-result-pruner 已在做，别重复）
+"toolResult": { "ops": [{ "op": "truncate", "maxChars": 1024 }] }
+
+// ⑥ 外部脚本（你自己的算法）：脚本路径 + 协议
+"reasoning": { "ops": [{ "op": "python", "script": "D:/shaper/my_shaper.py", "protocol": "json", "timeoutMs": 3000 }] }
+
+// ⑦ 让 LLM 来压（OpenAI 兼容端点 + 显式提示词）
+"reasoning": { "ops": [{ "op": "summarize", "prompt": "压成 3 行要点，保留路径与数字。", "maxTokens": 200 }] }
+```
+
+### 接自己的算法：三种方式
+
+| 方式 | 怎么写 | 能热改吗 | 适合 |
+|---|---|---|---|
+| **① 组合内置 op** | `"ops": [{ "op": "extract" }, { "op": "truncate", "maxChars": 300 }]` | ✅ 改配置文件即可 | 大多数场景。先用这个，别急着写代码 |
+| **② 外部脚本**（`python` op） | 脚本读 stdin、写 stdout；`{"op":"python","script":"…","protocol":"json"}` | ✅ 改配置文件即可 | 任意语言的算法；调试方便（可单独跑脚本） |
+| **③ 注入 JS 函数**（`config.ops`） | 见下 | ❌ **需重启**（原因见下） | 不想起子进程、要在进程内跑 |
+
+**方式 ③ 的写法** —— 在 `cordis.patch.yml` 里给这一行加 `config`：
+
+```yaml
+- insert:
+    - id: dsh-entry-shaper
+      name: dsh-entry-shaper
+      config:
+        ops:
+          # 自定义 op：函数签名 (text, op, ctx) => string | null；可以是 async
+          shout: !<tag:yaml.org,2002:js/function> |-
+            function (text) { return '!!!' + String(text).slice(0, 4) + '!!!' }
+          # 也可以只用字符串，把名字映射到内置 op（这个连函数都不用注入）
+          myalias: extract
+```
+
+> ⚠️ **代价（必须知道）**：注入函数 ⇒ patch 里出现了 `config:` 行 ⇒
+> `dshmarket/lib/hot.js:295` 判定为"含配置行"⇒ **本插件失去热挂载能力**（只能重启生效）。
+> 这是"自定义函数"与"热插拔"之间的取舍：**纯内置 op（含方式 ②，它只是配置参数）不受影响** ✓。
+>
+> ⚠️ `summarize` 的 `ctx.llm`（baseURL / apiKey / model）与**脱敏** `ctx.redact`
+> **只能从 patch 的 `config:` 传入**（函数与凭据无法写进 JSON 配置文件）⇒
+> 要用自定义凭据或脱敏，同样得放弃热挂载。若只是想让 `summarize` 指向你的端点，
+> 直接用 op 自己的 `baseURL` / `model` / `apiKey` 参数即可（那些在热配置文件里）✓。
+>
+> ⚠️ **自定义 op 也会进缓存**（`cache: false` 可关）：我们无法判断你的函数是否纯，
+> 而"结果漂移 ⇒ 前缀改变 ⇒ 付断点税"比"多占几 KB 磁盘"贵得多，所以**宁可多缓存**。
+> 因此**请用不同的 op 名字区分不同实现** —— 缓存键里只有**名字与参数**，
+> 函数体本身无法进键（`JSON.stringify` 会丢掉函数）。
+
+op 可任意链式组合，**可以是 async**，统一受 `opTimeoutMs`（默认 8s，可 per-op 覆盖）约束：
+超时或抛错 ⇒ **只跳过该 op**、保留上一步结果（fail-open）—— 最坏情况是"没省到"，
+绝不会挂住会话。未知 op 名同样被跳过（不会因为拼错名字就整条链失效）。
+
+一个**完整可用**的配置文件见 [`examples/config.full.json`](examples/config.full.json)，
+自定义 op 的两种写法见 [`examples/custom-op.md`](examples/custom-op.md)。
 
 ### 非纯 op 必须缓存（前缀稳定性的前提）
 

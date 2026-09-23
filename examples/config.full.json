@@ -1,0 +1,45 @@
+{
+  "enabled": true,
+  "shapeReasoning": true,
+
+  "policy": {
+    "reasoning": {
+      "ops": [
+        { "op": "extract", "maxChars": 240 }
+      ]
+    },
+    "toolResult": {
+      "ops": [
+        { "op": "keep" }
+      ]
+    },
+    "toolArgs": {
+      "ops": [
+        { "op": "keep" }
+      ]
+    },
+    "assistantText": {
+      "ops": [
+        { "op": "keep" }
+      ]
+    }
+  },
+
+  "cache": {
+    "enabled": true,
+    "maxBytes": 8388608,
+    "maxEntryChars": 16384
+  },
+
+  "proxy": {
+    "enabled": true,
+    "provider": "deepseek-shaped",
+    "upstream": "deepseek-official"
+  },
+
+  "opTimeoutMs": 8000,
+  "lagWarnMs": 2000,
+  "stubTemplate": "[reasoning omitted: {chars} chars]",
+  "dropUsageOnReplace": true,
+  "logStats": true
+}
