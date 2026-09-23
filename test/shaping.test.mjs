@@ -8,7 +8,7 @@ import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { apply } from '../index.js'
+import { apply, extractReasoning } from '../index.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const TMP = join(HERE, '.tmp')
@@ -133,6 +133,56 @@ test('可自定义桩模板', async () => {
   emit(handlers, session, makeEvent())
   await settle()
   assert.equal(appends[0][1].message.content[0].text, '<omitted 17>')
+})
+
+// ── 决策抽取（extract 模式）──
+
+test('抽取：只留决策句，按句式挑而不是按位置切', () => {
+  const text = 'The build failed. I should look at the log first. Then I will patch transform.js. '
+    + 'There are many other possibilities worth exploring in detail. Next I will rerun the tests.'
+  const out = extractReasoning(text, 200)
+  assert.ok(out.includes('I should look at the log first'), '应保留决策句')
+  assert.ok(out.includes('Then I will patch transform.js'))
+  assert.ok(!out.includes('many other possibilities'), '应丢掉非决策的探索句')
+})
+
+test('抽取：中文决策句', () => {
+  const out = extractReasoning('嗯，这个文件有点怪。接下来我要改 parse.js，然后跑测试。', 200)
+  assert.ok(out.includes('接下来我要改 parse.js'), '应认出中文决策句')
+})
+
+test('抽取：没有决策句时退回最后一句', () => {
+  const out = extractReasoning('Exploring many hypotheses. Nothing conclusive yet but the last line matters.', 200)
+  assert.equal(out, 'Nothing conclusive yet but the last line matters.')
+})
+
+test('抽取：遵守字符预算', () => {
+  const text = 'I will do thing number one. I will do thing number two. I will do thing number three.'
+  const out = extractReasoning(text, 40)
+  assert.ok(out.length <= 40, `预算内，实得 ${out.length}`)
+})
+
+test('抽取：空输入返回空串', () => {
+  assert.equal(extractReasoning('', 100), '')
+  assert.equal(extractReasoning(undefined, 100), '')
+})
+
+test('extract 模式：reasoning 换成"抽取 + 省略计数"，字段仍在', async () => {
+  const { handlers, appends, session } = setup({ reasoningMode: 'extract', extractMaxChars: 60 })
+  emit(handlers, session, makeEvent({
+    content: undefined,
+    data: { message: { content: [
+      { type: 'reasoning', text: `${'x'.repeat(500)} I will patch the parser now.` },
+      { type: 'text', text: 'answer' },
+      { type: 'tool-call', id: 'c1', name: 'run_shell', arguments: '{}' },
+    ] } },
+  }))
+  await settle()
+  const reasoning = appends[0][1].message.content.find((b) => b.type === 'reasoning')
+  assert.ok(reasoning, '字段必须仍在（缺字段会被 API 400）')
+  assert.ok(reasoning.text.startsWith('[reasoning extract:'), '带省略计数前缀')
+  assert.ok(reasoning.text.includes('I will patch the parser now'), '含抽取到的决策句')
+  assert.deepEqual(appends[0][1].message.content.map((b) => b.type), ['reasoning', 'text', 'tool-call'])
 })
 
 test('不复制 usage（否则 token-meter 会把同一步计两次）', async () => {

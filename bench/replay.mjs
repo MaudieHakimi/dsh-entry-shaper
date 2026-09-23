@@ -17,6 +17,10 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { zstdDecompressSync } from 'node:zlib'
 
+// 与插件共用同一实现（测的形态就是跑的形态）
+import { extractReasoning } from '../index.js'
+const EXTRACT_MAX = 240
+
 const MAGIC = [0x28, 0xb5, 0x2f, 0xfd]
 const argv = process.argv.slice(2)
 const file = argv.find((a) => !a.startsWith('--'))
@@ -124,6 +128,10 @@ const BASE = process.env.DSH_DEEPSEEK_BASE ?? 'https://api.deepseek.com'
 const shapeReasoning = (r, arm) => {
   if (!r.reasoning) return undefined
   if (arm === 'full') return r.reasoning
+  if (arm === 'extract') {
+    const picked = extractReasoning(r.reasoning, EXTRACT_MAX)
+    return `[reasoning extract: ${Math.max(0, r.reasoning.length - picked.length)} chars omitted] ${picked}`
+  }
   return `[reasoning omitted: ${r.reasoning.length} chars]` // stub
 }
 
@@ -163,34 +171,50 @@ function messagesUpTo(script, k, arm, { includeResponsesOfK }) {
 const sizeOf = (messages) => messages.reduce((a, m) => a + JSON.stringify(m).length, 0)
 
 if (DRY) {
+  const arms = (arg('dry-arms', 'full,stub,extract')).split(',')
   const rows = []
   for (let k = 0; k < script.length; k++) {
-    const full = messagesUpTo(script, k, 'full', { includeResponsesOfK: true })
-    const stub = messagesUpTo(script, k, 'stub', { includeResponsesOfK: true })
-    rows.push({ round: k + 1, step: script[k].step, fullChars: sizeOf(full), stubChars: sizeOf(stub) })
+    const sizes = {}
+    for (const arm of arms) sizes[arm] = sizeOf(messagesUpTo(script, k, arm, { includeResponsesOfK: true }))
+    rows.push({ round: k + 1, step: script[k].step, sizes, full: sizes.full })
   }
   const last = rows.at(-1)
-  const saved = 1 - last.stubChars / last.fullChars
   // 字符→token 换算：用本会话 reasoning 的实测系数（provider 自报 reasoningTokens / 文本字符数）
   const CHAR_TO_TOKEN = Number(arg('char-to-token', '0.2666'))
-  const savedChars = rows.reduce((a, r) => a + (r.fullChars - r.stubChars), 0)
-  const savedTokens = Math.round(savedChars * CHAR_TO_TOKEN)
-  const savedMoney = savedTokens * PRICE_HIT // 省下的是**命中价**的 token
+  const summary = {}
+  for (const arm of arms) {
+    const savedChars = rows.reduce((a, r) => a + (r.full - r.sizes[arm]), 0)
+    const savedTokens = Math.round(savedChars * CHAR_TO_TOKEN)
+    summary[arm] = {
+      lastChars: last.sizes[arm],
+      lastSavedPct: 1 - last.sizes[arm] / last.full,
+      savedChars,
+      savedTokens,
+      savedMoney: savedTokens * PRICE_HIT,
+    }
+  }
   if (JSON_OUT) {
-    console.log(JSON.stringify({ rounds: rows.length, rows, savedChars, savedTokens, savedMoney, charToToken: CHAR_TO_TOKEN }, null, 2))
+    console.log(JSON.stringify({ rounds: rows.length, rows, summary, charToToken: CHAR_TO_TOKEN }, null, 2))
     process.exit(0)
   }
   console.log(`\n=== 固定轨迹重放（离线模式，不打 API）===`)
   console.log(`剧本：turn=${script[0].turn} 内连续 ${script.length} 轮工具调用（来自 ${file.split(/[\\/]/).pop()}）`)
-  console.log(`\n轮次  payload 字符（full → stub）        省`)
+  console.log(`\n轮次   full 字符${arms.filter((a) => a !== 'full').map((a) => ` → ${a}`).join('')}`)
   for (const r of rows) {
-    console.log(`  ${String(r.round).padStart(2)}   ${r.fullChars.toLocaleString().padStart(9)} → ${r.stubChars.toLocaleString().padStart(9)}   ${((1 - r.stubChars / r.fullChars) * 100).toFixed(1)}%`)
+    const rest = arms.filter((a) => a !== 'full').map((a) => r.sizes[a].toLocaleString().padStart(9)).join('')
+    console.log(`  ${String(r.round).padStart(2)}   ${r.full.toLocaleString().padStart(9)}${rest}`)
   }
-  console.log(`\n末轮 payload：${last.fullChars.toLocaleString()} → ${last.stubChars.toLocaleString()} 字符（省 ${(saved * 100).toFixed(1)}%）`)
-  console.log(`整段剧本累计少发：${savedChars.toLocaleString()} 字符 ≈ ${savedTokens.toLocaleString()} token`)
-  console.log(`这些 token 是**命中价**的 ⇒ 省 ≈ $${savedMoney.toFixed(5)}（按 $0.02/M；换算系数 ${CHAR_TO_TOKEN}，可用 --char-to-token 覆盖）`)
-  console.log('\n⚠️ 只算"少发的 token × 命中价"，因为固定轨迹下两臂的**新增内容相同**（未命中应相等）。')
-  console.log('⚠️ 在线 A/B 实测成本不可信：provider 缓存在多次运行间被复用，第二次跑的臂几乎全命中（见 CHANGELOG）。')
+  console.log(`\n末轮 payload 相对 full 的削减：`)
+  for (const arm of arms.filter((a) => a !== 'full')) {
+    console.log(`  ${arm.padEnd(8)} ${last.sizes[arm].toLocaleString().padStart(9)} 字符（−${(summary[arm].lastSavedPct * 100).toFixed(1)}%）`)
+  }
+  console.log(`\n整段剧本累计少发 / 折成钱（命中价 $0.02/M）：`)
+  for (const arm of arms.filter((a) => a !== 'full')) {
+    const s = summary[arm]
+    console.log(`  ${arm.padEnd(8)} ${s.savedChars.toLocaleString().padStart(10)} 字符 ≈ ${s.savedTokens.toLocaleString().padStart(9)} token ⇒ $${s.savedMoney.toFixed(5)}`)
+  }
+  console.log('\n⚠️ 只算"少发的 token × 命中价"，因为固定轨迹下各臂的**新增内容相同**（未命中应相等）。')
+  console.log('⚠️ 在线 A/B 实测成本不可信：provider 缓存在多次运行间被复用（见 CHANGELOG）。')
   process.exit(0)
 }
 

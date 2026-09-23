@@ -36,14 +36,46 @@ const DEFAULTS = {
   enabled: true,
   // 是否处理 reasoning（总闸）
   dropReasoning: true,
-  // 'stub'（默认，把推理文本换成短桩：字段在、内容省）| 'drop'（整块删除，主对话路径会被 400）
+  // 'stub'（默认，短桩）| 'extract'（决策抽取：只留"我打算/下一步"那类句子）| 'drop'（整块删除，主对话路径会被 400）
   reasoningMode: 'stub',
   stubTemplate: '[reasoning omitted: {chars} chars]',
+  // extract 模式：决策句预算（字符）
+  extractMaxChars: 240,
   dropUsageOnReplace: true,
   logStats: true,
   // 可注入路径：默认写用户主目录；测试/嵌入时指向别处，避免污染
   logPath: DEFAULT_LOG,
   offSentinel: DEFAULT_OFF,
+}
+
+/** 决策句识别（确定性、零成本）：只按句式挑，不按位置截断。 */
+const DECISION_RE = /^(i'?ll|i will|i'?m going to|let me|next|now|first|then|finally|so i|i should|i need to|plan[:：]|todo)|(下一步|接下来|我现在|我先|我将|我要|我打算|先做|先看|然后|最后|计划[:：])/i
+
+/**
+ * 从推理文本里抽"决策句"。抽不到就退回最后一句（通常含着结论）。
+ * @param text - 原始推理文本
+ * @param maxChars - 预算（字符）
+ * @returns 抽取结果（可能为空串）
+ */
+export function extractReasoning(text, maxChars = 240) {
+  if (typeof text !== 'string' || text.trim() === '') return ''
+  // 切句：全角标点照切；ASCII 句号只在"空格 + 大写字母或汉字"时才切，
+  // 否则会把 `parse.js，` / `transform.js. There` 里的文件名从中间切开（踩过）。
+  const sentences = text
+    .split(/(?<=[。！？!?])\s*|(?<=\.)\s+(?=[A-Z\u4e00-\u9fff])/u)
+    .map((s) => s.trim())
+    .filter(Boolean)
+  const picked = []
+  let used = 0
+  for (const s of sentences) {
+    if (!DECISION_RE.test(s)) continue
+    if (used + s.length > maxChars) break
+    picked.push(s)
+    used += s.length
+  }
+  if (picked.length > 0) return picked.join(' ')
+  const last = sentences.at(-1) ?? text
+  return last.slice(-maxChars)
 }
 
 export function apply(ctx, config = {}) {
@@ -90,20 +122,34 @@ export function apply(ctx, config = {}) {
 
       const chars = reasoning.reduce((a, b) => a + (typeof b?.text === 'string' ? b.text.length : 0), 0)
 
-      // 两种塑形模式：
+      // 三种塑形模式：
       //   stub（默认）——把 reasoning 文本换成短桩：**字段仍在**，内容省掉。
       //     依据（bench/passback-stub.mjs 实测）：thinking 模式下"延续工具回路"
       //     （报文以 role:'tool' 结果结尾）时，缺 reasoning_content 会被拒：
       //       "The `reasoning_content` in the thinking mode must be passed back to the API."
       //     而把文本换成 `[reasoning omitted: N chars]` 后返回 200 ⇒ API 要的是字段在，不是内容全。
+      //   extract ——决策抽取：按**句式**（"我打算/下一步/I'll"…）挑句子，而不是按位置截断。
+      //     动机：实测"保留尾部 400 字符"反而更差，怀疑是截断点随机、割裂了半句。
       //   drop ——整块删除（更省，但只适用于"下一步不会延续工具回路"的场景；
       //     实测在主对话路径上会被 400 拒绝，非必要不要用）。
       let kept = content.filter((b) => b?.type !== 'reasoning')
-      if (cfg.reasoningMode === 'stub') {
-        const stub = cfg.stubTemplate.replace('{chars}', String(chars))
+      if (cfg.reasoningMode === 'stub' || cfg.reasoningMode === 'extract') {
         const at = content.findIndex((b) => b?.type === 'reasoning')
-        kept = content.map((b, i) => (b?.type === 'reasoning' ? { ...b, text: i === at ? stub : '' } : b))
-        kept = kept.filter((b, i) => b?.type !== 'reasoning' || i === at)
+        if (at >= 0) {
+          let replacement
+          if (cfg.reasoningMode === 'extract') {
+            const joined = reasoning.map((b) => (typeof b?.text === 'string' ? b.text : '')).join('\n')
+            const extract = extractReasoning(joined, cfg.extractMaxChars)
+            replacement = extract
+              ? `[reasoning extract: ${Math.max(0, chars - extract.length)} chars omitted] ${extract}`
+              : cfg.stubTemplate.replace('{chars}', String(chars))
+          } else {
+            replacement = cfg.stubTemplate.replace('{chars}', String(chars))
+          }
+          kept = content
+            .map((b, i) => (b?.type === 'reasoning' ? { ...b, text: i === at ? replacement : '' } : b))
+            .filter((b, i) => b?.type !== 'reasoning' || i === at)
+        }
       }
 
       // 官方约束：assistant 消息必须有 content 或 tool_calls。全被摘空时补一个空 text 块。

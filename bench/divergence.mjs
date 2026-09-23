@@ -17,6 +17,9 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { zstdDecompressSync } from 'node:zlib'
 
+// 与插件共用同一实现：基准里测的形态必须就是插件跑的形态（否则测的与跑的不是一回事）。
+import { extractReasoning } from '../index.js'
+
 const MAGIC = [0x28, 0xb5, 0x2f, 0xfd]
 
 const argv = process.argv.slice(2)
@@ -39,6 +42,7 @@ const PER_TURN = argv.includes('--per-turn')
 const MODEL = strArg('model', 'deepseek-flash')
 const MAX_TOKENS = numArg('max-tokens', 384)
 const TAIL = numArg('tail', 400)
+const EXTRACT_MAX = numArg('extract-max', 240)
 const JSON_OUT = argv.includes('--json')
 const PRICE_HIT = 0.02 / 1e6
 const PRICE_MISS = 1 / 1e6
@@ -143,6 +147,9 @@ function buildMessages(windowRounds, { mode, tailChars = 400 }) {
       assistant.reasoning_content = r.reasoning
     } else if (mode === 'stub' && r.reasoning) {
       assistant.reasoning_content = `[reasoning omitted: ${r.reasoning.length} chars]`
+    } else if (mode === 'extract' && r.reasoning) {
+      const picked = extractReasoning(r.reasoning, EXTRACT_MAX)
+      assistant.reasoning_content = `[reasoning extract: ${Math.max(0, r.reasoning.length - picked.length)} chars omitted] ${picked}`
     } else if (mode === 'stub-tail' && r.reasoning) {
       // 桩 + 保留思考的**尾部**（决定通常在后半段；头部多为探索）
       const tail = r.reasoning.length > tailChars ? r.reasoning.slice(-tailChars) : r.reasoning
@@ -287,7 +294,7 @@ for (const [i, target] of picked.entries()) {
 
   const a = await call(buildMessages(windowRounds, { mode: 'full' }), tools)
   const b = await call(buildMessages(windowRounds, { mode: 'stub' }), tools)
-  const c = await call(buildMessages(windowRounds, { mode: 'stub-tail', tailChars: TAIL }), tools)
+  const c = await call(buildMessages(windowRounds, { mode: 'extract' }), tools)
   const actionA = a.ok ? canonicalAction(a.message) : `ERROR:${a.status}`
   const actionB = b.ok ? canonicalAction(b.message) : `ERROR:${b.status}`
   const actionC = c.ok ? canonicalAction(c.message) : `ERROR:${c.status}`
@@ -327,11 +334,11 @@ if (JSON_OUT) {
   process.exit(0)
 }
 
-console.log('\n=== 行为分歧基准（full / stub / stub-tail 三臂）===')
+console.log('\n=== 行为分歧基准（full / stub / extract 三臂）===')
 console.log(`日志 ${file}`)
-console.log(`模型 ${MODEL} · case ${rows.length}（历史窗口 ${WINDOW} 轮）· max_tokens ${MAX_TOKENS} · 尾部保留 ${TAIL} 字符`)
+console.log(`模型 ${MODEL} · case ${rows.length}（历史窗口 ${WINDOW} 轮）· max_tokens ${MAX_TOKENS} · extract 预算 ${EXTRACT_MAX} 字符`)
 console.log('\n【四档一致率】full 为基准，比较塑形后是否给出"同一个动作"')
-console.log(`  档位        纯桩(stub)      桩+尾(stub-tail)`)
+console.log(`  档位        纯桩(stub)      决策抽取(extract)`)
 console.log(`  动作类型    ${rate('tStub', 'kind').padEnd(16)}${rate('tTail', 'kind')}`)
 console.log(`  同名工具    ${rate('tStub', 'tool').padEnd(16)}${rate('tTail', 'tool')}`)
 console.log(`  意图键      ${rate('tStub', 'intent').padEnd(16)}${rate('tTail', 'intent')}`)
@@ -350,7 +357,7 @@ if (kindDiff.length > 0) {
     console.log(`\ncase ${d.case} turn=${d.turn} step=${d.step}（推理 ${d.reasoningChars} 字符）`)
     console.log(`  full     : ${String(d.actionA).slice(0, 160)}`)
     console.log(`  stub     : ${String(d.actionB).slice(0, 160)}`)
-    console.log(`  stub-tail: ${String(d.actionC).slice(0, 160)}`)
+    console.log(`  extract : ${String(d.actionC).slice(0, 160)}`)
   }
 }
 const toolDiff = counted.filter((r) => r.tStub.kind && !r.tStub.tool)
