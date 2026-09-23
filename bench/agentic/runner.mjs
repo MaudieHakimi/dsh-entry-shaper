@@ -17,6 +17,11 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { TASKS, setupTask, runShell, readFileIn } from './tasks.mjs'
+import { DEEP_TASKS, setupDeepTask } from './deep-tasks.mjs'
+
+/** 短任务 + 长轨迹任务；--deep 只跑长轨迹，--tasks=id,id 精确指定。 */
+const ALL_TASKS = [...TASKS, ...DEEP_TASKS]
+const SETUP = (task, dir) => (DEEP_TASKS.includes(task) ? setupDeepTask(task, dir) : setupTask(task, dir))
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const WORK = join(HERE, '.work')
@@ -94,7 +99,7 @@ async function callApi(messages, { stubReasoning }) {
 async function runOne(task, arm) {
   const dir = join(WORK, `${task.id}-${arm}`)
   rmSync(dir, { recursive: true, force: true })
-  setupTask(task, dir)
+  SETUP(task, dir)
 
   const messages = [
     { role: 'system', content: SYSTEM },
@@ -155,7 +160,11 @@ async function runOne(task, arm) {
   return { arm, ok: checked.ok, detail: checked.detail, finished, stats, cost }
 }
 
-const wanted = ONLY === 'all' ? TASKS : TASKS.filter((t) => ONLY.split(',').includes(t.id))
+const wanted = argv.includes('--deep')
+  ? DEEP_TASKS
+  : ONLY === 'all'
+    ? ALL_TASKS
+    : ALL_TASKS.filter((t) => ONLY.split(',').includes(t.id))
 mkdirSync(WORK, { recursive: true })
 
 const results = []

@@ -1,137 +1,147 @@
 # dsh-entry-shaper
 
-DSH 插件：**入口塑造（payload shaping）**——在元素被**首次发送之前**定型，使 payload 前缀永远单调，
-从而**零断点税**地缩小上下文。当前实现一件事：把 assistant 消息里的 `reasoning` **桩化**
-（字段保留、内容换成 `[reasoning omitted: N chars]`，省掉 ~99% 的推理体积）。
+> 把上下文压缩从**出口**挪到**入口**：元素在被首次发送之前定型，此后永不改写 ⇒
+> payload 前缀永远单调 ⇒ **零断点税**地缩小上下文。
 
-> ⚠️ **当前默认关闭**（`cordis.patch.yml` 里 `enabled: false`）。原因：行为分歧基准显示
-> 桩化推理会改变模型的下一步动作（8 个真实 case 中精确匹配一致率 0/8，含真实分歧），
-> 质量代价未经确认前不要打开。见下方「基准」。
-
-- 📐 **工作管道**（当前真实路径，含源码出处）：[docs/PIPELINE.md](docs/PIPELINE.md)
-- 🧩 **处理层规范**（op 组合、槽位协议、LLM op 口径、里程碑）：[docs/PROCESSING.md](docs/PROCESSING.md)
-- 📊 **经济分析**（为什么"出口压缩"在 DeepSeek 上常常亏）：同机的 `dsh-context-slimmer/docs/ECONOMICS.md`
-- 🧪 **设计推导**（入口塑造 vs 出口压缩、两份存、硬约束）：`dsh-context-slimmer/docs/PAYLOAD-SHAPING.md`
-
-> ⚠️ **源码 100% 由 LLM 撰写**（多轮 agent 会话产出，人类审核验收）。按"未经人工逐行审查的软件"对待。
+**状态**：实验性 · **默认关闭** · 测试 17/17 · [为什么默认关闭](#现状与限制)
 
 ---
 
-## 30 秒理解
+## 问题
 
-| 事实 | 含义 |
-|---|---|
-| 上下文缓存按**逐字前缀**匹配 | 前缀一旦被改写，其后全部重新计费（断点税 = 那一刻整份 payload 的全价） |
-| 推理内容（`reasoning`）会跟着 assistant 消息**回传** | 它在 payload 里逐轮累积（实测占追加内容 **34.8%**） |
-| 但它**生成于本次调用、首次回传在下一次请求** | ⇒ 在首次回传之前定型 = 前缀里从未有过它 = **不打断任何已发送的前缀** |
-| DSH 的模型表面与人类转录**本来就是两条投影** | 替换副本是 model-only：界面/审计仍读 append 原文（含推理） |
+DSH 的 `compaction` 在**出口**改历史：把已发送的区间换成检查点。这有效，但每一刀都会打断
+前缀缓存——从改动点往后**整份 payload 全价重发**（"断点税"）。在缓存命中价极低的 provider 上
+（DeepSeek 命中/未命中 ≈ 1/50），这笔税常常比省下的钱还贵。
 
-**所以：日志留全（人看），上下文精简（模型看），一份都不用抄。**
+## 做法
 
-## 安装
+会话是一根**只进不出的栈**。元素在被**首次回传之前**定型，前缀里就从来没出现过它的旧形态：
 
-```powershell
-dsh plugin --profile <profile> add "file:D:\DSH Desktop\dsh-entry-shaper"
+```
+请求 n   : [S][T][U][1'][2']…[n-1']
+请求 n+1 : [S][T][U][1'][2']…[n-1'][n']
+           └──────── 逐字相同的前缀（全命中）────────┘ └ 新增 ┘
 ```
 
-或手动（本项目本机用法）：把目录复制进 `<profile>\node_modules\`，并在 profile 的 `package.json`
-里把 `dsh-entry-shaper` 加进 `dependencies` 与 `dsh.profile.bundles`（后者决定它是否被加载）。
+本插件当前只做一件事：把 `assistant` 消息里的 `reasoning`（思考）**换成一个短桩**。
+推理的量很大（实测占追加内容 34.8%），而它**生成于本次调用、首次回传在下一次请求** ——
+唯一的定型窗口就在这两者之间。
 
-> 与 `dsh-context-slimmer` / 官方 `dsh-compaction-basic` **共存**：本插件**不接管 `compaction` 服务**，
-> 因此不需要 bundle patch 里的 `disabled` 行。它在**入口**定型，那两者在**出口**压缩。
+## 它是什么 / 不是什么
 
-## 配置（`cordis.patch.yml`）
+| | |
+|---|---|
+| ✅ 表面层插件，订阅 `session/event`，用 `surfaceOp: { op: 'replace' }` 定型 | ❌ 不接管 `compaction` 服务（与官方 `dsh-compaction-basic`、`dsh-context-slimmer` 共存） |
+| ✅ 原文仍在 append-only 日志里；替换副本是 **model-only**，界面/审计读 append 原文 | ❌ 不改写**已发送**的内容（那是"出口压缩"的领域，要付断点税） |
+| ✅ 失败即放行（fail-open）：任何异常只写日志，表面保持原样 | ❌ 不发起任何网络请求、不读写用户文件（除自身日志与熔断哨兵）；日志不记录消息内容 |
+
+## 快速开始
+
+```powershell
+# 安装（profile 名按需替换）
+dsh plugin --profile web add "file:D:\DSH Desktop\dsh-entry-shaper"
+```
+
+或手动：把目录复制进 `<profile>\node_modules\`，并在 profile 的 `package.json` 中把
+`dsh-entry-shaper` 加进 `dependencies` 与 `dsh.profile.bundles`（后者决定它是否被加载）。
+
+配置（`cordis.patch.yml`）：
 
 ```yaml
 - insert:
     - id: dsh-entry-shaper
       name: dsh-entry-shaper
       config:
-        enabled: true              # 总开关
-        dropReasoning: true        # 当前唯一动作
-        dropUsageOnReplace: true   # 替换事件不带 usage（meter 按事件折算，复制会双计）
-        logStats: true
-        # logPath / offSentinel 默认在用户主目录，可注入（测试用）
+        enabled: false             # 默认关闭；确认可接受质量代价后再打开
+        dropReasoning: true        # 是否处理 reasoning（总闸）
+        reasoningMode: stub        # stub（桩化）| drop（整块删除，主对话路径会被 400）
+        stubTemplate: "[reasoning omitted: {chars} chars]"
+        dropUsageOnReplace: true   # 替换事件不带 usage（否则 token 统计双计）
 ```
 
-| 安全阀 | 用法 |
-|---|---|
-| **免重启熔断** | 建一个空文件 `~/.dsh-entry-shaper.OFF`（每 64 个事件检查一次） |
-| 配置关闭 | `enabled: false`（需重启） |
-| fail-open | 任何异常只写日志、绝不抛错；表面保持原样 |
-| 自激保护 | 只处理 `surfaceOp === 'append'` 的原始事件 |
-| 空内容保护 | 摘完为空时补一个空 `text` 块 |
+**免重启熔断**：在用户主目录建一个空文件 `~/.dsh-entry-shaper.OFF` 即停手。
 
-## 两条必须遵守的硬约束（踩过）
+验证：
+
+```powershell
+Get-Content "$env:USERPROFILE\.dsh-entry-shaper.log" -Tail 20
+# applied pid=… enabled=True …            ← 已生效
+# strip #1 seq=570 blocks=1 chars=624 provenance=553 项(首/末=17/570)
+```
+
+## 实测数据
+
+全部为本机真实会话/真实 API 的实测，脚本在 `bench/`，可复现。
+
+### 1. 规则（决定哪些算法可用）
+
+| 问题 | 结论 | 脚本 |
+|---|---|---|
+| 缺 `reasoning_content` 会被拒吗？ | 延续工具回路时**会**（400）；末尾有用户消息时不会 | `bench/passback-stub.mjs` |
+| 那换成短桩呢？ | **可以**（200）⇒ API 要求**字段在**，不要求内容全 | 同上（变体 I） |
+| 体积 | 3,500 字符 → 31 字符（**−99.1%**） | `test/` + 探针 |
+
+### 2. 行为分歧（真实历史，同一前缀发两次）
+
+来源：真实会话的"工具往返"快照，`full`（推理原样）vs `stub`（桩化）；四档一致率。
+
+| 档位 | 纯桩 | 桩+保留尾巴 |
+|---|---|---|
+| 动作类型（工具 vs 直接答复） | **13/17（76%）** | 10/17（59%） |
+| 同名工具 | 7/17（41%） | 5/17（29%） |
+| 完全一致 | 1/17（6%） | 1/17（6%） |
+
+**读法**：桩化确实改变行为；"保留思考尾巴"一致地更差（截断点随机、割裂半句）⇒ 已放弃该方向。
+
+### 3. agentic 基准（多轮工具调用 + 确定性判分）
+
+8 个任务（初始文件 + 提示 + 检查器），工具回路 `read_file` / `write_file` / `run_shell`：
+
+| 臂 | 成功率 | 轮数 | 工具调用 | 输入 token | 成本 |
+|---|---|---|---|---|---|
+| `full` | 8/8 | 35 | 36 | 31,580 | $0.0086 |
+| `stub` | 8/8 | 37 | 44 | 33,322 | $0.0086 |
+
+**读法**：短任务（3~6 轮）里推理占比太小 ⇒ **既不省也无风险**；插件的收益与**轨迹长度**成正比。
+
+## 现状与限制
+
+- **默认关闭**：行为分歧显示桩化会改变下一步动作（76% 同一"动作类型"，41% 同一工具），
+  质量代价需在长轨迹任务上确认；
+- **只处理 `reasoning`**：tool 结果（21.4%）与 tool 参数（40.2%）尚未塑形，
+  路线与风险序见 [`docs/PROCESSING.md`](docs/PROCESSING.md)；
+- **基准边界**：行为分歧测的是"是否被改变"，不是"是否更好"；agentic 基准目前任务偏短，
+  长轨迹任务（15~30 轮 + 大体量工具输出）正在补。
+
+## 两条硬约束（踩过，写下来）
 
 | 约束 | 出处 |
 |---|---|
 | 替换事件的 `sourceEventSeqs` 必须**原样沿用**原事件（每个 source 须是同 step 的 `assistant/chunk`、不重复、严格更早），否则**抛错** | `packages/llm/token-meter/src/index.ts:279-304` |
 | 替换事件**不复制** `usage`，否则同一步被计两次 | `packages/llm/token-meter/src/usage-projection.ts:82-84` |
 
-## 观测
+## 文档
+
+| 文档 | 内容 |
+|---|---|
+| [`docs/PIPELINE.md`](docs/PIPELINE.md) | 当前工作管道：总图、逐步时序（含 harness 源码出处）、元素生命周期、降级路径、验收观测点 |
+| [`docs/PROCESSING.md`](docs/PROCESSING.md) | 处理层规范：op 目录、`shaper` 槽位协议、LLM op 口径、里程碑 |
+| [`CHANGELOG.md`](CHANGELOG.md) | 变更记录（含 0.1.0 的 `drop` 被基准否掉的完整背景） |
+| [`SECURITY.md`](SECURITY.md) | 边界与失败模式 |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | 改动前必读 |
+
+## 开发
 
 ```powershell
-Get-Content "$env:USERPROFILE\.dsh-entry-shaper.log" -Tail 20
+node test/run-all.mjs                                          # 单测（17 例，无需 DSH 运行时）
+node bench/divergence.mjs "<session.jsonl.zstd>" --cases=20     # 行为分歧
+node bench/agentic/runner.mjs --max-rounds=20                   # agentic 基准（需真实 shell）
+node bench/passback-stub.mjs                                    # 规则边界探针
 ```
 
-```
-applied pid=… enabled=True dropReasoning=True log=… off=False
-subscribed session/event (global)
-strip #1 seq=570 turn=1 step=1 blocks=1 chars=624 provenance=553 项(首/末=17/570)
-strip #25 seq=… blocks=1 chars=711 | 累计 blocks=25 chars=17820 (≈4811 token) 运行 143s
-```
-
-**账单验收**（同机 `dsh-context-slimmer` 仓库的审计工具）：
-
-```powershell
-node "D:\DSH Desktop\dsh-context-slimmer\tools\session-cost-audit.mjs" "<session.jsonl.zstd>"
-```
-
-期望：每步输入下降、**未命中不出现"整份 payload"尖峰**、命中占比略升。
-
-## 测试
-
-```powershell
-node test/run-all.mjs      # 本机（受限沙箱下 `node --test` 会挂）
-node --test test/          # CI
-```
-
-## 基准（简洁、便宜、准确）
-
-```powershell
-# 行为分歧：同一前缀发两次（full 带完整推理 / stub 桩化），比"下一步动作"
-node bench/divergence.mjs "<session.jsonl.zstd>" --cases=8 --window=2
-# 规则边界：到底哪些 assistant 消息必须回传 reasoning_content
-node bench/passback-rule.mjs
-node bench/passback-stub.mjs
-```
-
-| 问题 | 答案（实测） | 出处 |
-|---|---|---|
-| 缺 `reasoning_content` 会被拒吗？ | **会**，但只在"延续工具回路"时（报文以 `role:'tool'` 结果结尾）⇒ 400 "must be passed back to the API"；末尾有用户消息时不会 | `bench/passback-stub.mjs` 变体 H/K vs A/B |
-| 那能不能换成短桩？ | **能**：把文本换成 `[reasoning omitted: N chars]` ⇒ 200 ✓ ⇒ **API 要的是字段在，不是内容全** | 变体 I vs H |
-| 桩化会改变模型的下一步吗？ | **会显著改变"具体动作"**：20 个真实 case 四档一致率 = 动作类型 **13/17（76%）** · 同名工具 7/17（41%） · 意图键 7/17（41%） · 完全一致 1/17（6%）⇒ **24% 的 case 做出了性质不同的决定**（工具 vs 直接答复）。注意：这测的是**行为改变**，不是好坏——变好变坏需要带判分的任务集。 | `bench/divergence.mjs --cases=20` |
-| **保留思考尾部会不会更好？** | **不会，一致地更差**：同一批 case 下桩+尾的动作类型只有 **10/17（59%）**、同名工具 5/17（29%）⇒ 割裂的半句/过时计划比"干净空桩"更容易误导。已放弃该方向。 | 同上（三臂 full/stub/stub-tail） |
-| 成本 | 20 case × 3 臂 = **$0.27**；8 case × 3 臂 = $0.12 | 同上 |
-
-> ⚠️ **样本量会骗人**：同一指标在 N=8 时给出"动作类型 8/8（100%）"，扩到 N=20 掉到 76%。
-> 任何结论请跑 `--cases=20` 以上并固定指标版本。
->
-> ⚠️ **本基准测的是"行为是否被改变"，不是"任务是否做得更好"**。要判好坏需要带**确定性判分**的
-> 任务集（固定任务 + 检查器，开/关两臂跑真实会话）——那是下一步。
-
-
-
-⇒ 这就是"简洁、便宜、准确"的基准：**真实历史 + 同一前缀 + 确定性打分 + 真实后续作锚点**。
-
-## 未验证 / 已知代价
-
-- **质量影响已测出方向、未测出量级**：桩化推理确实会改变下一步动作（精确匹配 0/8），
-  但"是同一意图的不同写法"还是"真的做错了事"需要更粗的指标（同名工具率、意图键）
-  或带评分的任务集来判定；
-- tool 结果（21.4%）与 tool 参数（40.2%）**尚未塑形**——按 `docs/PROCESSING.md` §6 的风险序推进。
+> 基准与检查器需要能捕获子进程输出的真实 shell（受限沙箱会拦 Node 的管道 spawn）；
+> shell 可用 `DSH_BENCH_SHELL` 指定，默认自动探测。
 
 ## 许可
 
-MIT，见 [LICENSE](LICENSE)。变更记录见 [CHANGELOG.md](CHANGELOG.md)。
+MIT，见 [`LICENSE`](LICENSE)。
