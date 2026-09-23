@@ -45,7 +45,7 @@ dsh plugin --profile web add "file:D:\DSH Desktop\dsh-entry-shaper"
 或手动：把目录复制进 `<profile>\node_modules\`，并在 profile 的 `package.json` 中把
 `dsh-entry-shaper` 加进 `dependencies` 与 `dsh.profile.bundles`（后者决定它是否被加载）。
 
-配置（`cordis.patch.yml`）：
+配置（`cordis.patch.yml`）——**处理层是可组合的 op 序列**：
 
 ```yaml
 - insert:
@@ -54,11 +54,21 @@ dsh plugin --profile web add "file:D:\DSH Desktop\dsh-entry-shaper"
       config:
         enabled: false             # 默认关闭；确认可接受质量代价后再打开
         dropReasoning: true        # 是否处理 reasoning（总闸）
-        reasoningMode: extract     # extract（决策抽取，推荐）| stub（短桩）| drop（整块删除，会被 400）
-        extractMaxChars: 240       # extract 模式的决策句预算
-        stubTemplate: "[reasoning omitted: {chars} chars]"
+        policy:                    # 按内容类别各给一条 op 序列（文本 → 文本 的纯函数链）
+          reasoning:      { ops: [{ op: extract, maxChars: 240 }] }               # 决策抽取
+          toolResult:     { ops: [{ op: truncate, maxChars: 1024 }] }             # 首尾桩；默认 keep
+          toolArgs:       { ops: [{ op: keep }] }
+          assistantText:  { ops: [{ op: keep }] }
         dropUsageOnReplace: true   # 替换事件不带 usage（否则 token 统计双计）
 ```
+
+**可用 op**：`keep` · `drop` · `stub` · `extract` · `head` · `tail` · `truncate`（首尾保留 + 省略计数）。
+op 可任意链式组合，例如 `[{op: extract}, {op: truncate, maxChars: 80}]`；
+未知 op 会被跳过（fail-open）。
+
+> 兼容旧配置：`reasoningMode: extract | stub | drop` 仍然可用，会被折算成 `policy.reasoning.ops`
+> （显式 `policy` 优先）。注意 **reasoning 永远不会被整块删除**——thinking 模式下缺字段会被 API
+> 拒绝（400），内核会把它退回短桩。
 
 **免重启熔断**：在用户主目录建一个空文件 `~/.dsh-entry-shaper.OFF` 即停手。
 

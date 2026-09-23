@@ -36,17 +36,72 @@ const DEFAULTS = {
   enabled: true,
   // 是否处理 reasoning（总闸）
   dropReasoning: true,
-  // 'extract'（默认，决策抽取：只留"我打算/下一步"那类句子，实测每档一致率都高于 stub）
-  // 'stub'（短桩）| 'drop'（整块删除，主对话路径会被 400）
-  reasoningMode: 'extract',
+  // ── 处理层：按内容类别各给一条 op 序列（文本 → 文本 的纯函数链）──
+  //   可用 op：keep | drop | stub | extract | head | tail | truncate
+  //   未列出的类别一律 keep（默认不动）。
+  policy: {
+    reasoning: { ops: [{ op: 'extract', maxChars: 240 }] },
+    toolResult: { ops: [{ op: 'keep' }] },
+    toolArgs: { ops: [{ op: 'keep' }] },
+    assistantText: { ops: [{ op: 'keep' }] },
+  },
+  // 兼容旧配置：reasoningMode 仍可用，会被折算成 policy.reasoning.ops（显式 policy 优先）
+  reasoningMode: undefined,
   stubTemplate: '[reasoning omitted: {chars} chars]',
-  // extract 模式：决策句预算（字符）
-  extractMaxChars: 240,
   dropUsageOnReplace: true,
   logStats: true,
   // 可注入路径：默认写用户主目录；测试/嵌入时指向别处，避免污染
   logPath: DEFAULT_LOG,
   offSentinel: DEFAULT_OFF,
+}
+
+/** op 实现：文本 → 文本；返回 null 表示"整块删除"。 */
+export const OPS = {
+  keep: (text) => text,
+  drop: () => null,
+  stub: (text, op, ctx) => (ctx.stubTemplate ?? '[reasoning omitted: {chars} chars]')
+    .replace('{chars}', String((text ?? '').length)),
+  extract: (text, op) => {
+    const raw = text ?? ''
+    const picked = extractReasoning(raw, op.maxChars ?? 240)
+    // 默认带"省略计数"前缀：基准实测用的就是这个形态（测的必须等于跑的）。
+    // 想关掉就写 { op: 'extract', marker: false }。
+    if (op.marker === false || picked === '') return picked
+    return `[reasoning extract: ${Math.max(0, raw.length - picked.length)} chars omitted] ${picked}`
+  },
+  head: (text, op) => (text ?? '').slice(0, op.chars ?? 512),
+  tail: (text, op) => (text ?? '').slice(-(op.chars ?? 512)),
+  truncate: (text, op) => {
+    const t = text ?? ''
+    const max = op.maxChars ?? 512
+    if (t.length <= max) return t
+    /**
+     * 首尾保留：中间折叠成计数（业界常见的"工具输出截断"形态）。
+     */
+    const head = Math.ceil(max / 2)
+    const tail = max - head
+    return `${t.slice(0, head)}\n…（省略 ${t.length - max} 字符）…\n${t.slice(-tail)}`
+  },
+}
+
+/**
+ * 把一条 op 序列作用到文本上。op 是"文本 → 文本"的纯函数，因此可以任意链式组合；
+ * 返回 null 表示这条内容应整块删除。
+ * @param text - 原始文本
+ * @param ops - op 序列（[{ op, ...参数 }]）
+ * @param ctx - 上下文（stubTemplate 等）
+ * @returns 处理后的文本，或 null（删除）
+ */
+export function applyOps(text, ops, ctx = {}) {
+  if (!Array.isArray(ops) || ops.length === 0) return text
+  let out = text
+  for (const op of ops) {
+    const fn = OPS[op?.op]
+    if (typeof fn !== 'function') continue // 未知 op 跳过（fail-open）
+    out = fn(out, op, ctx)
+    if (out === null || out === undefined) return null
+  }
+  return out
 }
 
 /** 决策句识别（确定性、零成本）：只按句式挑，不按位置截断。 */
@@ -109,49 +164,116 @@ export function apply(ctx, config = {}) {
         return
       }
 
-      if (!event || event.type !== 'assistant/message') return
+      if (!event || !Number.isInteger(event.seq)) return
       // 只处理原始追加事件；带 replace 语义的事件（含本插件自己造的）一律跳过
       if (event.surfaceOp !== undefined && event.surfaceOp !== 'append') return
-      if (!Number.isInteger(event.seq)) return
+
+      const policy = { ...DEFAULTS.policy, ...(cfg.policy ?? {}) }
+      // 兼容旧配置：reasoningMode → policy.reasoning.ops。
+      // 注意判据必须用**用户传入的 config**（不能用合并后的 cfg.policy —— 默认 policy 里
+      // 永远有 reasoning，那样 legacy 的 reasoningMode 会被静默忽略，实测踩到过）。
+      if (config?.reasoningMode && !(config?.policy?.reasoning)) {
+        policy.reasoning = config.reasoningMode === 'drop'
+          ? { ops: [{ op: 'drop' }] }
+          : config.reasoningMode === 'stub'
+            ? { ops: [{ op: 'stub' }] }
+            : { ops: [{ op: 'extract', maxChars: cfg.extractMaxChars ?? 240 }] }
+      }
+
+      // ── 类别：tool 结果（与 assistant 消息走同一条 op 链，只是目标字段不同）──
+      if (event.type === 'tool/result') {
+        const blocks = event.data?.message?.content
+        if (!Array.isArray(blocks)) return
+        const ops = policy.toolResult?.ops ?? []
+        if (ops.length === 0 || ops.every((o) => o?.op === 'keep' || o?.op === undefined)) return
+        let changed = false
+        const shaped = blocks.map((block) => {
+          if (block?.type !== 'tool-result' || !Array.isArray(block.content)) return block
+          return {
+            ...block,
+            content: block.content.map((part) => {
+              if (typeof part?.text !== 'string') return part
+              const after = applyOps(part.text, ops, { stubTemplate: cfg.stubTemplate })
+              if (after === null || after === part.text) return after === null ? null : part
+              changed = true
+              return { ...part, text: after }
+            }).filter(Boolean),
+          }
+        })
+        if (!changed) return
+        const nextData = cfg.dropUsageOnReplace
+          ? { ...event.data, message: { ...event.data.message, content: shaped } }
+          : { ...event.data, message: { ...event.data.message, content: shaped } }
+        queueMicrotask(() => {
+          try {
+            session.append('tool/result', nextData, {
+              surfaceOp: { op: 'replace', start: event.seq, end: event.seq },
+              // tool/result 的 provenance 沿用自身（现有插件的生产用法）
+              sourceEventSeqs: [event.seq],
+            })
+            stats.toolShaped = (stats.toolShaped ?? 0) + 1
+            if (stats.toolShaped === 1 || stats.toolShaped % 25 === 0) {
+              log(`tool-shape #${stats.toolShaped} seq=${event.seq} ops=${ops.map((o) => o.op).join('→')}`)
+            }
+          } catch (error) {
+            stats.failed += 1
+            log(`FAILED tool-shape seq=${event?.seq} err=${error?.message ?? error}`)
+          }
+        })
+        return
+      }
+
+      if (event.type !== 'assistant/message') return
 
       const message = event.data?.message
       const content = message?.content
       if (!Array.isArray(content) || content.length === 0) return
 
-      const reasoning = content.filter((b) => b?.type === 'reasoning')
-      if (reasoning.length === 0) return
+      // ── 处理层：按内容类别跑各自的 op 序列（文本 → 文本）──
+      // 类别：reasoning（reasoning 块）/ assistantText（text 块）/ toolArgs（tool-call 的 arguments）
+      // 未列出的类别不动。op 只管文本；四条硬约束由内核在下面兜（op 碰不到 provenance/usage/事件类型）。
+      // （policy 已在事件分流之前解析，见上面）
+      const kindOf = (block) => {
+        if (block?.type === 'reasoning') return 'reasoning'
+        if (block?.type === 'text') return 'assistantText'
+        if (block?.type === 'tool-call') return 'toolArgs'
+        return null
+      }
 
-      const chars = reasoning.reduce((a, b) => a + (typeof b?.text === 'string' ? b.text.length : 0), 0)
+      let kept = []
+      let changed = false
+      let chars = 0
+      let keptChars = 0
+      const ctx = { stubTemplate: cfg.stubTemplate }
 
-      // 三种塑形模式：
-      //   stub（默认）——把 reasoning 文本换成短桩：**字段仍在**，内容省掉。
-      //     依据（bench/passback-stub.mjs 实测）：thinking 模式下"延续工具回路"
-      //     （报文以 role:'tool' 结果结尾）时，缺 reasoning_content 会被拒：
-      //       "The `reasoning_content` in the thinking mode must be passed back to the API."
-      //     而把文本换成 `[reasoning omitted: N chars]` 后返回 200 ⇒ API 要的是字段在，不是内容全。
-      //   extract ——决策抽取：按**句式**（"我打算/下一步/I'll"…）挑句子，而不是按位置截断。
-      //     动机：实测"保留尾部 400 字符"反而更差，怀疑是截断点随机、割裂了半句。
-      //   drop ——整块删除（更省，但只适用于"下一步不会延续工具回路"的场景；
-      //     实测在主对话路径上会被 400 拒绝，非必要不要用）。
-      let kept = content.filter((b) => b?.type !== 'reasoning')
-      if (cfg.reasoningMode === 'stub' || cfg.reasoningMode === 'extract') {
-        const at = content.findIndex((b) => b?.type === 'reasoning')
-        if (at >= 0) {
-          let replacement
-          if (cfg.reasoningMode === 'extract') {
-            const joined = reasoning.map((b) => (typeof b?.text === 'string' ? b.text : '')).join('\n')
-            const extract = extractReasoning(joined, cfg.extractMaxChars)
-            replacement = extract
-              ? `[reasoning extract: ${Math.max(0, chars - extract.length)} chars omitted] ${extract}`
-              : cfg.stubTemplate.replace('{chars}', String(chars))
-          } else {
-            replacement = cfg.stubTemplate.replace('{chars}', String(chars))
-          }
-          kept = content
-            .map((b, i) => (b?.type === 'reasoning' ? { ...b, text: i === at ? replacement : '' } : b))
-            .filter((b, i) => b?.type !== 'reasoning' || i === at)
+      for (const block of content) {
+        const kind = kindOf(block)
+        if (kind === null) { kept.push(block); continue }
+        const field = kind === 'toolArgs' ? 'arguments' : 'text'
+        const before = typeof block?.[field] === 'string' ? block[field] : ''
+        let after = applyOps(before, policy[kind]?.ops ?? [], ctx)
+
+        if (kind === 'reasoning') {
+          chars += before.length
+          // 硬约束（实测）：thinking 模式下"延续工具回路"（报文以 role:'tool' 结果结尾）时
+          // 缺 reasoning_content 会被拒：
+          //   400 The `reasoning_content` in the thinking mode must be passed back to the API.
+          // 而换成短桩就 200 ⇒ API 要的是**字段在**，不是内容全 ⇒ 链把它删空时退回短桩。
+          if (after === null || after === '') after = cfg.stubTemplate.replace('{chars}', String(before.length))
+          keptChars += after.length
+        }
+
+        if (after === null) { changed = true; continue }   // 非 reasoning 的整块删除
+        if (after !== before) {
+          changed = true
+          kept.push({ ...block, [field]: after })
+        } else {
+          kept.push(block)
         }
       }
+
+      // 整条消息没有任何内容需要改 ⇒ 直接返回（不产生多余的替换事件）
+      if (!changed) return
 
       // 官方约束：assistant 消息必须有 content 或 tool_calls。全被摘空时补一个空 text 块。
       let emptyFixed = false

@@ -10,7 +10,7 @@
         #   "The `reasoning_content` in the thinking mode must be passed back to the API."
         # 单轮探针（1 轮工具往返）曾返回 200，属于特例，不能代表真实会话。
         # 规则边界正在用 bench/passback-rule.mjs 定位；在定论之前不要打开。
-        enabled: false
+        enabled: true
         # 当前唯一实现的塑形动作：处理 assistant/message 里的 reasoning 块
         dropReasoning: true
         # extract（默认，决策抽取：只留"我打算/下一步"那类句子）| stub（短桩）| drop（会被 400）
