@@ -44,7 +44,13 @@ function setup(config = {}) {
   // ⇒ refreshCfg 沿用 patch 传入的 config，测试才只测被显式传进来的东西。
   const configPath = join(TMP, `cfg-${caseNo}.json`)
   rmSync(configPath, { force: true })
-  apply(ctx, { logPath, offSentinel: sentinel, configPath, surfaceAssistant: true, ...config })
+  // cache.path 也要隔离：DEFAULTS 指向**真实主目录**的 ~/.dsh-entry-shaper.cache.jsonl，
+  // 不隔离会让用例互相污染、并受本机真实缓存影响（实测踩到）。
+  apply(ctx, {
+    logPath, offSentinel: sentinel, configPath, surfaceAssistant: true,
+    cache: { enabled: true, path: join(TMP, `cache-${caseNo}.jsonl`) },
+    ...config,
+  })
   return { handlers, appends, session, logPath, sentinel, ctx }
 }
 
@@ -60,7 +66,11 @@ function setupStream(config = {}) {
   // 同上：隔离 configPath，避免读到主目录里的真实热配置
   const configPath = join(TMP, `stream-cfg-${caseNo}.json`)
   rmSync(configPath, { force: true })
-  apply(ctx, { logPath, offSentinel: sentinel, configPath, ...config })
+  apply(ctx, {
+    logPath, offSentinel: sentinel, configPath,
+    cache: { enabled: true, path: join(TMP, `stream-cache-${caseNo}.jsonl`) },
+    ...config,
+  })
   return {
     streamListener: listeners.find((l) => l.name === 'llm/stream')?.handler,
     listeners,
@@ -268,13 +278,24 @@ test('链式 op：extract → truncate 依次生效', async () => {
   assert.ok(out.includes('省略'), 'truncate 留下省略标记')
 })
 
-// ── 异步 op：LLM 调用 / Python 接口（都用注入的 mock，不真的出网或起进程）──
+// ── 异步 op：LLM 调用 / 外部进程（都用注入的 mock，不真的出网或起进程）──
+//
+// ⚠️ mock 的响应对象**必须同时实现 text() 与 json()**：统一协议下 http op 会先取
+// 响应**原文**（`res.text()`）再解析（这样才能兼容非 OpenAI 形状的服务）。
+// 只实现 json() 的旧 mock 会让 op 抛错并被 fail-open 跳过 ⇒ 表现为"返回原文"，
+// 看起来像功能坏了，其实是 mock 形状过时（实测踩到，故在此标注）。
+
+/** 造一个 OpenAI 兼容形状的 mock 响应（同时支持 text() 与 json()）。 */
+function openAiResponse(content) {
+  const payload = { choices: [{ message: { content } }] }
+  return { ok: true, status: 200, text: async () => JSON.stringify(payload), json: async () => payload }
+}
 
 test('summarize op：OpenAI 兼容请求 + 显式提示词（mock fetch）', async () => {
   let seen = null
   const fetchMock = async (url, init) => {
     seen = { url, body: JSON.parse(init.body), auth: init.headers.authorization }
-    return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: '要点三行' } }] }) }
+    return openAiResponse('要点三行')
   }
   const out = await applyOps('很长很长的一段工具输出', [{ op: 'summarize', model: 'm', maxTokens: 64, prompt: '压成三点' }], {
     fetch: fetchMock, llm: { baseURL: 'https://api.example.com/', apiKey: 'sk-test' },
@@ -291,7 +312,7 @@ test('summarize op：出网前过 redact（mock fetch）', async () => {
   let sent = null
   const fetchMock = async (_url, init) => {
     sent = JSON.parse(init.body).messages[1].content
-    return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: 'ok' } }] }) }
+    return openAiResponse('ok')
   }
   await applyOps('token=sk-abcdefghijklmnop', [{ op: 'summarize' }], {
     fetch: fetchMock, llm: { apiKey: 'k' }, redact: (t) => t.replace(/sk-[a-z]+/u, '[REDACTED]'),
@@ -300,7 +321,7 @@ test('summarize op：出网前过 redact（mock fetch）', async () => {
 })
 
 test('summarize op：HTTP 失败 ⇒ 该 op 跳过（保留上一步结果，fail-open）', async () => {
-  const fetchMock = async () => ({ ok: false, status: 500, json: async () => ({}) })
+  const fetchMock = async () => ({ ok: false, status: 500, text: async () => '', json: async () => ({}) })
   const out = await applyOps('原文', [{ op: 'stub' }, { op: 'summarize' }], { fetch: fetchMock, llm: { apiKey: 'k' } })
   assert.equal(out, '[reasoning omitted: 2 chars]', 'LLM 失败后应保留 stub 的结果')
 })
@@ -337,6 +358,174 @@ test('python op：纯文本协议与退出码非 0', async () => {
   assert.equal(okText, '纯文本结果')
   const failed = await applyOps('x', [{ op: 'stub' }, { op: 'python', script: 's.py' }], { spawn: () => makeChild('', 2) })
   assert.equal(failed, '[reasoning omitted: 1 chars]', '子进程失败应跳过该 op')
+})
+
+// ── 统一协议：传输 × 数据格式（exec / http / inline）──────────────────────────
+
+/** 造一个假的子进程：stdout/stderr 按序吐出，退出码可控。 */
+function fakeChild({ stdout = '', stderr = '', code = 0 } = {}) {
+  return {
+    stdout: { on: (e, f) => { if (e === 'data') setTimeout(() => f(stdout), 0) } },
+    stderr: { on: (e, f) => { if (e === 'data' && stderr !== '') setTimeout(() => f(stderr), 0) } },
+    stdin: { end: () => {} },
+    on: (event, fn) => { if (event === 'close') setTimeout(() => fn(code), 3) },
+    kill: () => {},
+  }
+}
+
+/** 记录 spawn 收到的 (command, args, opts)。 */
+function spySpawn(child) {
+  const seen = []
+  return {
+    seen,
+    spawn: (command, args, opts) => { seen.push({ command, args, opts }); return child },
+  }
+}
+
+test('统一协议 exec：env / cwd 能传下去（env 与 process.env 合并）', async () => {
+  const calls = []
+  const spawn = (command, args, opts) => { calls.push({ command, args, opts }); return fakeChild({ stdout: 'x' }) }
+  await applyOps('t', [{ op: 'exec', command: 'c', cwd: 'D:/tmp', env: { MY: '1' } }], { spawn })
+  assert.equal(calls[0].opts.cwd, 'D:/tmp')
+  assert.equal(calls[0].opts.env.MY, '1')
+  // ⚠️ Windows 上它叫 `Path` 而不是 `PATH` ⇒ 别按大写断言（踩过）
+  assert.ok(calls[0].opts.env.Path !== undefined || calls[0].opts.env.PATH !== undefined,
+    '原有环境变量必须保留（env 是"追加"而不是"替换"）')
+})
+
+test('统一协议 exec：任何命令都行（node 也是 exec，不再是 python 专用）', async () => {
+  const spy = spySpawn(fakeChild({ stdout: '{"text":"处理结果"}\n' }))
+  const out = await applyOps('原始', [{ op: 'exec', command: 'node', script: 'shaper.mjs' }], { spawn: spy.spawn })
+  assert.equal(out, '处理结果')
+  assert.equal(spy.seen[0].command, 'node', 'command 决定用哪个解释器')
+  assert.deepEqual(spy.seen[0].args, ['shaper.mjs'], 'script 作为第一个参数')
+})
+
+test('统一协议 exec：json 信封含 text/kind/meta/op/protocol', async () => {
+  let captured = ''
+  const child = fakeChild({ stdout: '{"text":"ok"}' })
+  child.stdin = { end: (s) => { captured = s } }
+  await applyOps('待处理', [{ op: 'exec', command: 'x', script: 's' }], {
+    spawn: () => child, kind: 'reasoning', meta: { a: 1 },
+  })
+  const env = JSON.parse(captured)
+  assert.equal(env.text, '待处理')
+  assert.equal(env.kind, 'reasoning')
+  assert.deepEqual(env.meta, { a: 1 })
+  assert.equal(env.op, 'exec')
+  assert.equal(env.protocol, 1, '协议版本号 —— 统一协议的握手依据')
+})
+
+test('统一协议 exec：protocol=argv 把文本当命令行参数、不写 stdin', async () => {
+  let stdinUsed = false
+  const child = fakeChild({ stdout: 'out' })
+  child.stdin = { end: () => { stdinUsed = true } }
+  const spy = spySpawn(child)
+  // 用 {text} 占位符自己决定文本在参数里的位置（argv 协议也会自动追加一次）
+  const out = await applyOps('要传的文本', [{ op: 'exec', command: 'x', args: ['--upper', '{text}'], protocol: 'argv' }], { spawn: spy.spawn })
+  assert.equal(out, 'out')
+  assert.deepEqual(spy.seen[0].args, ['--upper', '要传的文本', '要传的文本'],
+    '{text} 占位符 + argv 自动追加各一次（想只出现一次就别用占位符）')
+  assert.equal(stdinUsed, false, 'argv 协议不应写 stdin')
+})
+
+test('统一协议 exec：protocol=argv 且不用占位符 ⇒ 文本只在末尾出现一次', async () => {
+  const spy = spySpawn(fakeChild({ stdout: 'out' }))
+  await applyOps('T', [{ op: 'exec', command: 'x', args: ['--upper'], protocol: 'argv' }], { spawn: spy.spawn })
+  assert.deepEqual(spy.seen[0].args, ['--upper', 'T'])
+})
+
+test('统一协议 exec：protocol=lines 先送 kind 再送文本', async () => {
+  let captured = ''
+  const child = fakeChild({ stdout: 'r' })
+  child.stdin = { end: (s) => { captured = s } }
+  await applyOps('正文', [{ op: 'exec', command: 'x', protocol: 'lines' }], { spawn: () => child, kind: 'toolResult' })
+  assert.equal(captured, 'toolResult\n正文')
+})
+
+test('统一协议 exec：stdout 为 {text:null} ⇒ 整块删除；退出码非 0 ⇒ 只跳过该 op', async () => {
+  const del = await applyOps('x', [{ op: 'exec', command: 'c' }], { spawn: spySpawn(fakeChild({ stdout: '{"text":null}' })).spawn })
+  assert.equal(del, null, 'text:null 表示删除')
+  const kept = await applyOps('x', [{ op: 'stub' }, { op: 'exec', command: 'c' }], {
+    spawn: spySpawn(fakeChild({ stdout: '', code: 3 })).spawn,
+  })
+  assert.equal(kept, '[reasoning omitted: 1 chars]', '失败只跳过该 op')
+})
+
+test('统一协议 http：自定义 body 整包覆盖（接非 OpenAI 形状的服务）', async () => {
+  let seen = null
+  const fetchMock = async (url, init) => {
+    seen = { url, body: JSON.parse(init.body) }
+    return { ok: true, status: 200, text: async () => JSON.stringify({ output: '压缩完' }) }
+  }
+  const out = await applyOps('大段文本', [{
+    op: 'http', url: 'https://my.example/shaper', body: { input: '{{text}}', mode: 'fast' },
+  }], { fetch: fetchMock })
+  assert.equal(out, '压缩完', '响应里 output 字段也能取到')
+  assert.equal(seen.body.input, '大段文本', '{{text}} 被替换')
+  assert.equal(seen.body.mode, 'fast')
+})
+
+test('统一协议 http：instruction 作为第二条 system 消息追加', async () => {
+  let body = null
+  const fetchMock = async (_u, init) => {
+    body = JSON.parse(init.body)
+    return { ok: true, status: 200, text: async () => 'x' }
+  }
+  await applyOps('t', [{ op: 'http', url: 'https://e/x', system: '系统词', instruction: '再简短些' }], { fetch: fetchMock })
+  assert.equal(body.messages[0].content, '系统词')
+  assert.equal(body.messages[1].content, '再简短些')
+  assert.equal(body.messages[2].role, 'user')
+})
+
+test('统一协议 inline：firstLine / jsonField / regex（纯字符串 ⇒ 可热改）', async () => {
+  assert.equal(await applyOps('a\nb\nc', [{ op: 'inline', use: 'firstLine', maxLines: 2 }]), 'a\nb')
+  assert.equal(await applyOps('{"a":{"b":"深层"}}', [{ op: 'inline', use: 'jsonField', field: 'a.b' }]), '深层')
+  assert.equal(await applyOps('id=42', [{ op: 'inline', use: 'regex', pattern: 'id=(\\d+)', template: '#$1' }]), '#42')
+})
+
+test('统一协议 inline.code：源码字符串（可热改），且总是走缓存', async () => {
+  // ⚠️ 缓存文件必须**每次运行都清掉**：`caseNo` 是模块级计数器、每次运行都从同一个数开始
+  // ⇒ 同名文件里会留着**上一次运行**的条目 ⇒ 第二次运行起就命中旧缓存
+  //（实测踩到：本机缓存里已有一条 key 相同的条目，导致"编译次数"断言失败）。
+  const compiled = []
+  const inlineCachePath = join(TMP, `inline-${caseNo += 1}.jsonl`)
+  rmSync(inlineCachePath, { force: true })
+  const cache = createOpCache({ cache: { enabled: true, path: inlineCachePath } }, () => {})
+  const ctx = { compileInline: (body) => { compiled.push(body); return (text) => String(text).slice(0, 2) }, cache }
+  assert.equal(await applyOps('abcdef', [{ op: 'inline', use: 'code', code: 'return text.slice(0,2)' }], ctx), 'ab')
+  assert.equal(compiled.length, 1, '首次执行应编译一次')
+  assert.equal(await applyOps('abcdef', [{ op: 'inline', use: 'code', code: 'return text.slice(0,2)' }], ctx), 'ab',
+    '第二次应命中缓存')
+  assert.equal(compiled.length, 1, '缓存命中时不再编译')
+})
+
+test('旧名兼容：python / summarize 与统一协议实现等价', async () => {
+  const spy = spySpawn(fakeChild({ stdout: '{"text":"ok"}' }))
+  const viaAlias = await applyOps('t', [{ op: 'python', script: 's.py' }], { spawn: spy.spawn })
+  const viaExec = await applyOps('t', [{ op: 'exec', command: 'python', script: 's.py' }], { spawn: spy.spawn })
+  assert.equal(viaAlias, 'ok')
+  assert.equal(viaExec, 'ok')
+  assert.equal(spy.seen[0].command, 'python', 'python 别名默认用 python 解释器')
+  assert.deepEqual(spy.seen[0].args, spy.seen[1].args, '两条路径参数一致')
+})
+
+test('统一协议 exec：python 自动带上 PYTHONIOENCODING=utf-8（Windows 中文会乱码）', async () => {
+  // 实测：Windows 上 Python 往管道写非 ASCII 默认用 cp936，而插件按 utf8 解码 ⇒ 中文变 ????
+  // （`python -X utf8` 无效，那条只管源码/文件）。所以插件替 python 默认设好，且用户可覆盖。
+  const calls = []
+  const spawn = (command, args, opts) => { calls.push({ command, opts }); return fakeChild({ stdout: 'x' }) }
+  await applyOps('t', [{ op: 'exec', command: 'python', script: 's.py' }], { spawn })
+  assert.equal(calls[0].opts.env.PYTHONIOENCODING, 'utf-8', 'python 应自动带上 UTF-8 输出设置')
+
+  await applyOps('t', [{ op: 'exec', command: 'D:/tools/python3.exe', script: 's.py' }], { spawn })
+  assert.equal(calls[1].opts.env.PYTHONIOENCODING, 'utf-8', '绝对路径的 python.exe 也要认')
+
+  await applyOps('t', [{ op: 'exec', command: 'python', script: 's.py', env: { PYTHONIOENCODING: 'gbk' } }], { spawn })
+  assert.equal(calls[2].opts.env.PYTHONIOENCODING, 'gbk', '用户显式设置优先')
+
+  await applyOps('t', [{ op: 'exec', command: 'node', args: ['-e', '0'] }], { spawn })
+  assert.equal(calls[3].opts.env, undefined, '非 python 命令不加这个变量')
 })
 
 test('未知 op 被跳过（fail-open）', async () => {
@@ -539,7 +728,7 @@ test('缓存：LLM op 同一输入只算一次', async () => {
   let calls = 0
   const fetchMock = async () => {
     calls += 1
-    return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: `摘要${calls}` } }] }) }
+    return { ok: true, status: 200, text: async () => JSON.stringify({ choices: [{ message: { content: `摘要${calls}` } }] }) }
   }
   const cache = createOpCache({ cache: { path: cachePath, enabled: true } }, () => {})
   const ctx = { fetch: fetchMock, llm: { apiKey: 'k' }, cache }
@@ -558,7 +747,7 @@ test('缓存：重启后仍命中（新实例读同一个文件）', async () =>
   let calls = 0
   const fetchMock = async () => {
     calls += 1
-    return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: '重启前的摘要' } }] }) }
+    return { ok: true, status: 200, text: async () => JSON.stringify({ choices: [{ message: { content: '重启前的摘要' } }] }) }
   }
   const ops = [{ op: 'summarize', prompt: '压成要点' }]
 
@@ -580,7 +769,7 @@ test('缓存：配置变了（prompt/model）自动失效', async () => {
   let calls = 0
   const fetchMock = async () => {
     calls += 1
-    return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: `v${calls}` } }] }) }
+    return { ok: true, status: 200, text: async () => JSON.stringify({ choices: [{ message: { content: `v${calls}` } }] }) }
   }
   const cache = createOpCache({ cache: { path: cachePath, enabled: true } }, () => {})
   const ctx = { fetch: fetchMock, llm: { apiKey: 'k', model: 'm1' }, cache }
@@ -607,7 +796,7 @@ test('缓存：关闭后每次都调用', async () => {
   let calls = 0
   const fetchMock = async () => {
     calls += 1
-    return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: 'x' } }] }) }
+    return { ok: true, status: 200, text: async () => JSON.stringify({ choices: [{ message: { content: 'x' } }] }) }
   }
   const cache = createOpCache({ cache: { enabled: false, path: join(TMP, 'unused.jsonl') } }, () => {})
   const ctx = { fetch: fetchMock, llm: { apiKey: 'k' }, cache }
@@ -665,7 +854,7 @@ test('shapeMessages：非纯 op 走缓存（两次塑形只调用一次 LLM）',
   let calls = 0
   const fetchMock = async () => {
     calls += 1
-    return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: '要点' } }] }) }
+    return { ok: true, status: 200, text: async () => JSON.stringify({ choices: [{ message: { content: '要点' } }] }) }
   }
   const ctx = { fetch: fetchMock, llm: { apiKey: 'k' }, cache: createOpCache({ cache: { path: cachePath, enabled: true } }, () => {}) }
   const policy = { reasoning: { ops: [{ op: 'summarize' }] }, toolResult: { ops: [{ op: 'keep' }] }, toolArgs: { ops: [{ op: 'keep' }] }, assistantText: { ops: [{ op: 'keep' }] } }

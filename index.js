@@ -48,25 +48,71 @@ const DEFAULT_CONFIG = join(homedir(), '.dsh-entry-shaper.config.json')
 // 值 = 该次塑形结果。append-only JSONL（崩溃安全、可直接查看），启动时全量读进内存。
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** 只对"非纯"op 启用缓存；纯 op 本来可复现，缓存只会白占磁盘。 */
-const CACHED_OPS = new Set(['summarize', 'python'])
+/**
+ * 纯 op：同一输入**必然**同一输出 ⇒ 不需要缓存（缓存只会白占磁盘）。
+ * 其余一切（外部进程 / HTTP / 自定义注入 / inline.code）都**无法证明**是纯的 ⇒ 一律进缓存。
+ *
+ * 这是"统一协议"的一半：插件不再按 op 名判断要不要缓存，而是按"能不能证明是纯函数"。
+ */
+const PURE_OPS = new Set(['keep', 'drop', 'stub', 'extract', 'head', 'tail', 'truncate', 'stdout', 'firstLine', 'jsonField', 'regex'])
 
-/** 生效配置指纹：任何会改变输出的配置都必须进这个串。 */
+/**
+ * `inline.code` 的代码注入：`config.inline` 是**源码字符串**（可以写进 JSON 配置文件 ⇒ 可热改），
+ * 用 `new Function` 求值一次并缓存。这样"进程内自定义算法"也有字符串表达形式，
+ * 不必把函数塞进 patch（那会因 `config:` 行而失去热挂载）。
+ *
+ * 安全边界：`code` 来自**你自己的配置文件**，等价于你在 DSH 进程里执行代码 ——
+ * 与 `exec` op 同级风险（都在你配置之后才会发生），不额外扩大攻击面。
+ * @param fnBody - 函数体源码，形如 `return text.slice(0, 10)`
+ * @param cacheMap - 按源码串缓存编译结果
+ * @returns 编译后的函数 (text, op) => string|null
+ */
+function compileInline(fnBody, cacheMap) {
+  const key = String(fnBody)
+  const hit = cacheMap.get(key)
+  if (hit !== undefined) return hit
+  // eslint-disable-next-line no-new-func -- 见上：源码来自用户自己的配置
+  const compiled = new Function('text', 'op', 'ctx', key)
+  cacheMap.set(key, compiled)
+  return compiled
+}
+
+/**
+ * 生效配置指纹：任何会改变输出的配置都必须进这个串。
+ * 注意里面**不能有函数**（`JSON.stringify` 会丢掉它们 ⇒ 不同实现撞同一个键）。
+ * 键里能表达身份的只有：op 名 + 参数 + 输入文本。
+ */
 function effectiveFingerprint(op, ctx) {
   return JSON.stringify({
-    baseURL: op.baseURL ?? ctx.llm?.baseURL ?? 'https://api.deepseek.com',
+    op: op.op,
+    protocol: op.protocol ?? 'json',
+    // ── http ──
+    url: op.url ?? op.baseURL,
+    method: op.method,
     model: op.model ?? ctx.llm?.model ?? 'deepseek-flash',
-    prompt: op.prompt ?? '<default>',
-    maxTokens: op.maxTokens ?? 256,
-    script: op.script,
+    system: op.system ?? op.prompt,
+    instruction: op.instruction,
+    maxTokens: op.maxTokens,
+    body: op.body,
+    // ── exec ──
     command: op.command,
     args: op.args,
+    cwd: op.cwd,
+    // ── inline ──
+    field: op.field,
+    pattern: op.pattern,
+    template: op.template,
+    flags: op.flags,
+    code: op.code,
   })
 }
 
 export function createOpCache(cfg, log) {
-  const enabled = cfg.cache?.enabled !== false
-  const path = cfg.cache?.path ?? DEFAULT_CACHE
+  const enabled = (cfg.cache?.enabled ?? cfg.cacheEnabled) !== false
+  // 路径两处都认：嵌套的 `cache.path`（插件配置的形状）与扁平的 `cachePath`
+  // （op 上下文的形状）。只认前者会让 `createOpCache({ cache: { path } })` 这类调用
+  // **静默使用主目录的真实缓存** —— 实测踩到（测试因此互相污染、并读到本机缓存）。
+  const path = cfg.cache?.path ?? cfg.cachePath ?? DEFAULT_CACHE
   const maxBytes = cfg.cache?.maxBytes ?? 8 * 1024 * 1024
   const maxEntryChars = cfg.cache?.maxEntryChars ?? 16384
   const map = new Map()
@@ -203,112 +249,316 @@ export const OPS = {
     return `${t.slice(0, head)}\n…（省略 ${t.length - max} 字符）…\n${t.slice(-tail)}`
   },
 
-  /**
-   * Python 接口：把文本通过 stdin 交给用户脚本，读 stdout 作为塑形结果。
-   *
-   * 协议（默认 json）：stdin 收到一行 JSON `{"text": "...", "kind": "reasoning", "meta": {...}}`；
-   * stdout 若是 `{"text": "..."}` 则取该字段，否则取 stdout 原文（trim 后）。
-   * 退出码非 0 / 超时 / 输出为空 ⇒ 抛错 ⇒ 该 op 被跳过（fail-open，保留上一步结果）。
-   *
-   * 注：spawn 可经 ctx.spawn 注入（便于测试）；默认用 node:child_process。
-   */
-  python: async (text, op, ctx) => {
-    const spawn = ctx.spawn ?? (await import('node:child_process')).spawn
-    const command = op.command ?? 'python'
-    const args = [op.script, ...(op.args ?? [])]
-    if (!op.script) throw new Error('python op 需要配置 script 路径')
-    const protocol = op.protocol ?? 'json'
-    const input = protocol === 'text'
-      ? String(text ?? '')
-      : `${JSON.stringify({ text: text ?? '', kind: ctx.kind ?? null, meta: ctx.meta ?? {} })}\n`
-    const timeout = op.timeoutMs ?? 8000
+  // ────────────────────────────────────────────────────────────────────────────────
+  //  统一协议（v1）
+  //
+  //  任何"要动用外部资源"的塑形，都归到**两个正交维度**：
+  //      传输（transport）   ：本地进程 exec ｜ HTTP 端点 http ｜ 进程内 inline
+  //      数据格式（protocol）：json ｜ text ｜ lines ｜ argv
+  //
+  //  op 名只表示**传输方式**，不再表示"这是 .py / 这是 LLM"——后者只是 command/url 的取值。
+  //  python / node / pwsh / 你自己的 exe 都走 exec；任何 OpenAI 兼容端点都走 http。
+  //
+  //  ── 信封（envelope）：每次调用**必须**送出的输入 ──
+  //      { "text": "<待塑形文本>", "kind": "<reasoning|toolResult|toolArgs|assistantText>",
+  //        "meta": { ... }, "op": "<op 名>", "protocol": 1 }
+  //
+  //  ── 返回值：三种形态都接受，按此顺序判定 ──
+  //      1. JSON 对象含字符串 text   ⇒ 取 text
+  //      2. JSON 对象含 null text    ⇒ 整块删除
+  //      3. 其它                     ⇒ 取 stdout/响应体原文（trim 后）
+  //
+  //  ── 失败 → 只跳过该 op（fail-open），保留上一步结果 ──
+  //      退出码非 0 / 超时 / 输出为空 / 抛错，全部只影响这一个 op。
+  // ────────────────────────────────────────────────────────────────────────────────
 
-    return await new Promise((resolve, reject) => {
-      let child
-      try {
-        child = spawn(command, args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
-      } catch (error) {
-        reject(error)
+  /**
+   * 外部进程（**任何**命令：python / node / pwsh / 你的 exe）。
+   *
+   * 参数：
+   *   command   必填，可执行文件（python / node / pwsh / D:/tools/shaper.exe）
+   *   args      追加参数数组；含 `{}` 的元素会被替换成"脚本路径"（见 script）
+   *   script    便捷写法：等价于把 script 作为第一个参数（兼容旧 `python` op）
+   *   protocol  输入格式与输出解析方式，见下
+   *   cwd       工作目录
+   *   env       追加的环境变量
+   *   timeoutMs 覆盖全局超时
+   *
+   * protocol：
+   *   json（默认） stdin 一行信封 JSON；stdout 按上面的返回值规则解析
+   *   text         stdin 纯文本；stdout 取原文
+   *   lines        stdin 第一行 = kind，其余 = 文本；stdout 取原文
+   *   argv         **不写 stdin**，把文本作为最后一个命令行参数传入；stdout 取原文
+   *                （适合"不接受 stdin 的现成程序"；注意命令行长度上限）
+   */
+  exec: async (text, op, ctx) => {
+    const spawn = ctx.spawn ?? (await import('node:child_process')).spawn
+    if (!op.command) throw new Error('exec op 需要一个 command（例如 "python" / "node" / "pwsh"）')
+    const protocol = op.protocol ?? 'json'
+    const timeout = op.timeoutMs ?? ctx.opTimeoutMs ?? 8000
+    const raw = String(text ?? '')
+    const envelope = {
+      text: raw,
+      kind: ctx.kind ?? null,
+      meta: ctx.meta ?? {},
+      op: op.op,
+      protocol: 1,
+    }
+    // args：`{}` 是"脚本路径"的占位符；`{text}` 是"把文本塞进参数"的占位符
+    let args = (op.args ?? []).map(String)
+    if (op.script !== undefined) args = [String(op.script), ...args]
+    args = args.map((a) => (a === '{}' ? String(op.script ?? '') : a.replace('{text}', raw)))
+    let stdin = ''
+    if (protocol === 'json') stdin = `${JSON.stringify(envelope)}\n`
+    else if (protocol === 'lines') stdin = `${ctx.kind ?? ''}\n${raw}`
+    else if (protocol === 'text') stdin = raw
+    else if (protocol === 'argv') args = [...args, raw]
+    else throw new Error(`exec op 的 protocol 不认识：${protocol}（可用 json / text / lines / argv）`)
+
+    const stdout = await runProcess(spawn, op.command, args, {
+      input: protocol === 'argv' ? '' : stdin,
+      // argv 协议**完全不碰 stdin**（有些程序会因此等待输入）：传 false 表示"不写"。
+      writeStdin: protocol !== 'argv',
+      cwd: op.cwd,
+      env: withEncodingDefaults(op.command, op.env),
+      timeoutMs: timeout,
+      label: op.op ?? 'exec',
+    })
+    return parseShaped(stdout)
+  },
+
+  /**
+   * HTTP 端点（任何 OpenAI 兼容服务，或你自己的塑形服务）。
+   *
+   * 参数：
+   *   url 或 baseURL   端点。给 baseURL 时自动补 `/chat/completions`；给 url 则原样使用
+   *   apiKey           Bearer 令牌（否则取 ctx.llm.apiKey / DEEPSEEK_API_KEY）
+   *   system           系统提示词（正文塑形指令）
+   *   instruction      追加在 system 之后的一条 system 消息（用于"再压一点"这类微调）
+   *   model / maxTokens / temperature / headers
+   *   body             **整包覆盖**请求体（给了它就不用上面的默认形状 ——
+   *                    想接非 OpenAI 形状的服务时用；`{{text}}` 会被替换成待塑形文本）
+   *   protocol         json（默认）｜ text（响应体当纯文本，不走 choices[].message.content）
+   */
+  http: async (text, op, ctx) => {
+    const fetchFn = ctx.fetch ?? globalThis.fetch
+    if (typeof fetchFn !== 'function') throw new Error('没有可用的 fetch')
+    const raw = String(text ?? '')
+    // baseURL 的回退链：op.baseURL → ctx.llm.baseURL（可经 patch config 注入）→ DeepSeek 官方。
+    // 给了 url 则原样使用（接非 OpenAI 形状的服务时走这条）。
+    const base = (op.baseURL ?? ctx.llm?.baseURL ?? 'https://api.deepseek.com').replace(/\/+$/u, '')
+    const url = op.url ?? `${base}/chat/completions`
+    if (!url) throw new Error('http op 需要 url 或 baseURL')
+    const apiKey = op.apiKey ?? ctx.llm?.apiKey ?? process.env.DEEPSEEK_API_KEY ?? ctx.apiKey
+    const protocol = op.protocol ?? 'json'
+    // 出网前脱敏（只有注入了 ctx.redact 才生效；它是函数 ⇒ 只能从 patch 的 config 传入）
+    const payloadText = typeof ctx.redact === 'function' ? ctx.redact(raw) : raw
+    const headers = {
+      'content-type': 'application/json',
+      ...apiKey === undefined ? {} : { authorization: `Bearer ${apiKey}` },
+      ...op.headers ?? {},
+    }
+    let body
+    if (op.body !== undefined) {
+      const tpl = JSON.stringify(op.body)
+      body = tpl.replaceAll('{{text}}', JSON.stringify(payloadText).slice(1, -1))
+      if (protocol !== 'json') body = JSON.stringify({ text: payloadText })
+    } else {
+      const system = op.system ?? op.prompt
+        ?? '把下面的内容压成简短要点，保留数字、路径、标识符与结论；不要添加原文没有的信息。'
+      const messages = [{ role: 'system', content: system }]
+      if (op.instruction !== undefined) messages.push({ role: 'system', content: String(op.instruction) })
+      messages.push({ role: 'user', content: payloadText })
+      body = JSON.stringify({
+        model: op.model ?? ctx.llm?.model ?? 'deepseek-flash',
+        stream: false,
+        temperature: op.temperature ?? 0,
+        max_tokens: op.maxTokens ?? 256,
+        messages,
+      })
+    }
+    const res = await fetchFn(url, { method: op.method ?? 'POST', headers, body })
+    if (!res.ok) throw new Error(`${op.op} HTTP ${res.status}`)
+    const textBody = await res.text()
+    if (protocol === 'text') return parseShaped(textBody)
+    typeOpenAiShape: {
+      const json = (() => { try { return JSON.parse(textBody) } catch { return null } })()
+      if (json === null) break typeOpenAiShape
+      const content = json?.choices?.[0]?.message?.content
+      if (typeof content === 'string') return parseShaped(content)
+      // 有些兼容服务把结果放在别的字段：{ text } / { output } / { content }
+      for (const key of ['text', 'output', 'content', 'data']) {
+        const v = json?.[key]
+        if (typeof v === 'string') return parseShaped(v)
+      }
+    }
+    return parseShaped(textBody)
+  },
+
+  /**
+   * 进程内算法（**不需要写脚本、不需要起进程**）：把"常见取法"数据化。
+   *
+   *   { "op": "inline", "use": "stdout" }                      → 自身输出（恒等，等价 keep）
+   *   { "op": "inline", "use": "firstLine", "maxLines": 3 }    → 取前 N 行
+   *   { "op": "inline", "use": "jsonField", "field": "x.y" }   → 从 JSON 里取字段
+   *   { "op": "inline", "use": "regex", "pattern": "…", "flags": "gi", "template": "$1" }
+   *   { "op": "inline", "use": "code", "code": "return text.slice(0, 100)" }
+   *
+   * `code` 是**函数体源码**（不是函数对象）⇒ 可以写进热配置文件 ⇒ **仍然可热改** ✓。
+   * 上面前四种 form 是纯函数；`code` 的纯度取决于你写什么，因此它**总是走缓存**
+   * （见 applyOps 的 provablyPure 判据）。
+   */
+  inline: (text, op, ctx) => {
+    const t = String(text ?? '')
+    const use = op.use ?? 'stdout'
+    if (use === 'stdout') return t
+    if (use === 'firstLine') {
+      const n = op.maxLines ?? 1
+      return t.split('\n').slice(0, n).join('\n')
+    }
+    if (use === 'jsonField') {
+      const obj = JSON.parse(t)
+      let cur = obj
+      for (const part of String(op.field ?? '').split('.').filter(Boolean)) cur = cur?.[part]
+      if (cur === null || cur === undefined) return null
+      return typeof cur === 'string' ? cur : JSON.stringify(cur)
+    }
+    if (use === 'regex') {
+      const re = new RegExp(String(op.pattern ?? ''), op.flags ?? '')
+      if (op.template !== undefined) return t.replace(re, String(op.template))
+      const m = t.match(re)
+      if (m === null) return t
+      return m[1] ?? m[0]
+    }
+    if (use === 'code') {
+      if (typeof op.code !== 'string' || op.code.trim() === '') throw new Error('inline.code 需要 code（函数体源码）')
+      if (ctx.compileInline === undefined) throw new Error('inline.code 需要一个编译入口（插件运行时会提供）')
+      return ctx.compileInline(op.code)(t, op, ctx)
+    }
+    throw new Error(`inline 的 use 不认识：${use}（可用 stdout / firstLine / jsonField / regex / code）`)
+  },
+
+  /** `stdout` 与 `exec` 同协议，只是不带 command：用于"我自己算"的链内占位。 */
+  stdout: (text) => String(text ?? ''),
+}
+
+/**
+ * 从一个外部结果（stdout / 响应体）里取出塑形后的文本。
+ * 返回值规则见文件上方"统一协议"注释。
+ * @param raw - 原始字符串
+ * @returns 塑形后的文本；null 表示整块删除
+ */
+export function parseShaped(raw) {
+  const text = String(raw ?? '').trim()
+  if (text === '') throw new Error('塑形结果为空白（外部程序没有输出）')
+  if (text.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(text)
+      if (parsed !== null && typeof parsed === 'object' && 'text' in parsed) {
+        const t = parsed.text
+        if (t === null) return null
+        if (typeof t === 'string') return t
+      }
+    } catch { /* 不是 JSON ⇒ 当纯文本 */ }
+  }
+  return text
+}
+
+/**
+ * 给子进程补上"UTF-8 输出"的默认环境变量。
+ *
+ * **为什么必须做**（本机实测踩到）：Windows 上 Python 往**管道**写非 ASCII 时默认用系统
+ * 代码页（GBK/cp936），而本插件按 utf8 解码 ⇒ 中文全变 `????` ✗。实测：
+ *   默认                 ⇒ `[py] … ????=1`
+ *   `PYTHONIOENCODING=utf-8` ⇒ `[py] … 行数=2` ✓
+ *   `python -X utf8`     ⇒ **无效**（那条只管源码/文件，不管管道）
+ * 所以这里替 `python` 默认设上；用户在 `env` 里给同名键即可覆盖，也可用它关掉。
+ * 非 Python 命令不动（Node 的管道本来就是 utf8）。
+ * @param command - 可执行文件名/路径
+ * @param env - 用户配置的 env（最高优先级）
+ * @returns 合并后的 env（可能为 undefined ⇒ 表示"用进程默认环境"）
+ */
+function withEncodingDefaults(command, env) {
+  const name = String(command ?? '').split(/[\\/]/).pop()?.toLowerCase() ?? ''
+  if (!/^py(thon)?(3(\.\d+)?)?(\.exe)?$/.test(name)) return env
+  return { PYTHONIOENCODING: 'utf-8', ...env ?? {} }
+}
+
+/**
+ * 起一个子进程并收集 stdout（统一 exec 的进程管理，便于测试注入 spawn）。
+ * @param spawn - node:child_process.spawn 或注入的等价物
+ * @param command - 可执行文件
+ * @param args - 参数数组
+ * @param opts - { input, cwd, env, timeoutMs, label }
+ * @returns stdout 字符串（退出码非 0 会 reject）
+ */
+function runProcess(spawn, command, args, opts = {}) {
+  const { input = '', writeStdin = true, cwd, env, timeoutMs = 8000, label = 'exec' } = opts
+  return new Promise((resolve, reject) => {
+    let child
+    try {
+      child = spawn(command, args, {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true,
+        ...cwd === undefined ? {} : { cwd },
+        ...env === undefined ? {} : { env: { ...process.env, ...env } },
+      })
+    } catch (error) {
+      reject(error)
+      return
+    }
+    let stdout = ''
+    let stderr = ''
+    let settled = false
+    const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      try { child.kill() } catch { /* 忽略 */ }
+      reject(new Error(`${label} 超时（${timeoutMs}ms）`))
+    }, timeoutMs)
+    if (typeof timer.unref === 'function') timer.unref()
+
+    child.stdout?.on('data', (d) => { stdout += String(d) })
+    child.stderr?.on('data', (d) => { stderr += String(d) })
+    child.on('error', (error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      reject(error)
+    })
+    child.on('close', (code) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      if (code !== 0) {
+        reject(new Error(`${label} 退出码 ${code}${stderr ? `：${stderr.slice(0, 200)}` : ''}`))
         return
       }
-      let stdout = ''
-      let stderr = ''
-      let settled = false
-      const timer = setTimeout(() => {
-        if (settled) return
-        settled = true
-        try { child.kill() } catch { /* 忽略 */ }
-        reject(new Error(`python op 超时（${timeout}ms）`))
-      }, timeout)
-      if (typeof timer.unref === 'function') timer.unref()
-
-      child.stdout?.on('data', (d) => { stdout += String(d) })
-      child.stderr?.on('data', (d) => { stderr += String(d) })
-      child.on('error', (error) => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        reject(error)
-      })
-      child.on('close', (code) => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        if (code !== 0) {
-          reject(new Error(`python 退出码 ${code}${stderr ? `：${stderr.slice(0, 200)}` : ''}`))
-          return
-        }
-        const raw = stdout.trim()
-        if (raw === '') { reject(new Error('python 输出为空')); return }
-        if (protocol === 'json' && raw.startsWith('{')) {
-          try {
-            const parsed = JSON.parse(raw)
-            if (typeof parsed?.text === 'string') { resolve(parsed.text); return }
-          } catch { /* 当纯文本处理 */ }
-        }
-        resolve(raw)
-      })
+      resolve(stdout)
+    })
+    if (writeStdin) {
       try {
         child.stdin?.end(input)
       } catch { /* 忽略 */ }
-    })
-  },
+    }
+  })
+}
 
+/**
+ * 旧名兼容（**弃用**，仅本版保留；请改用统一协议名）：
+ *   python    → exec   （command 默认 python，script 作为第一个参数）
+ *   summarize → http   （baseURL 自动补 /chat/completions，prompt 即 system）
+ * 两个别名都只是"预填了几个参数"，走的是同一套实现 ⇒ 行为与缓存语义完全一致。
+ */
+export const DEPRECATED_OPS = {
+  python: (text, op, ctx) => OPS.exec(text, { command: 'python', ...op }, ctx),
   /**
-   * OpenAI 兼容的 LLM 塑形：`POST {baseURL}/chat/completions`，显式提示词，温度 0。
-   * 出网前可经 ctx.redact 脱敏；失败/超时/空返回 ⇒ 抛错 ⇒ 该 op 跳过（fail-open）。
-   * fetch / apiKey 均可注入（便于测试与复用主会话凭据）。
+   * `summarize` → `http`。**不要预填 baseURL** —— `http` 自己有一条回退链
+   * （op.baseURL → ctx.llm.baseURL → DeepSeek 官方），预填会把 `ctx.llm.baseURL` 短路掉
+   * （实测踩到：测试里注入的 llm.baseURL 被忽略，请求打到了官方端点）。
+   * 别名只做一件有价值的事：把旧参数名 `prompt` 映射到新的 `system`（`http` 本身也兼容 prompt）。
    */
-  summarize: async (text, op, ctx) => {
-    const fetchFn = ctx.fetch ?? globalThis.fetch
-    if (typeof fetchFn !== 'function') throw new Error('没有可用的 fetch')
-    const baseURL = (op.baseURL ?? ctx.llm?.baseURL ?? 'https://api.deepseek.com').replace(/\/+$/u, '')
-    const apiKey = op.apiKey ?? ctx.llm?.apiKey ?? process.env.DEEPSEEK_API_KEY ?? ctx.apiKey
-    if (!apiKey) throw new Error('summarize op 缺少 apiKey')
-    const model = op.model ?? ctx.llm?.model ?? 'deepseek-flash'
-    const prompt = op.prompt
-      ?? '把下面的内容压成简短要点，保留数字、路径、标识符与结论；不要添加原文没有的信息。'
-    const payloadText = typeof ctx.redact === 'function' ? ctx.redact(String(text ?? '')) : String(text ?? '')
-    const res = await fetchFn(`${baseURL}/chat/completions`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model,
-        stream: false,
-        temperature: 0,
-        max_tokens: op.maxTokens ?? 256,
-        messages: [
-          { role: 'system', content: prompt },
-          { role: 'user', content: payloadText },
-        ],
-      }),
-    })
-    if (!res.ok) throw new Error(`LLM ${res.status}`)
-    const json = await res.json()
-    const out = json?.choices?.[0]?.message?.content
-    if (typeof out !== 'string' || out.trim() === '') throw new Error('LLM 返回为空')
-    return out.trim()
-  },
+  summarize: (text, op, ctx) => OPS.http(text, op, ctx),
 }
 
 /**
@@ -335,18 +585,24 @@ export async function applyOps(text, ops, ctx = {}) {
   let out = text
   for (const op of ops) {
     // `op.__fn` 允许调用方注入自定义实现（插件运行时用它支持 `config.ops`）；
-    // 直接使用导出 API 时只写 `{ op: 'extract', … }` 即可，仍然查内置表。
-    const fn = typeof op?.__fn === 'function' ? op.__fn : OPS[op?.op]
+    // 直接使用导出 API 时只写 `{ op: 'exec', … }` 即可，仍然查内置表。
+    // 旧名（python / summarize）作为别名仍然可用，走的是同一套统一协议实现。
+    // 注：别名函数收到的是**原样的 op**（op.op 仍是 'python'/'summarize'），
+    // 这正是别名内部要预填参数所依据的信息。
+    const fn = typeof op?.__fn === 'function' ? op.__fn : (OPS[op?.op] ?? DEPRECATED_OPS[op?.op])
     if (typeof fn !== 'function') continue // 未知 op 跳过（fail-open）
     try {
       const timeout = op.timeoutMs ?? ctx.opTimeoutMs ?? 8000
-      // 非纯 op（LLM / 外部脚本）：先查缓存，命中就复用 ⇒ 同一条输入在多次出网之间
-      // 得到逐字节相同的结果 ⇒ 前缀稳定（这是 wire 级塑形能"零税"的前提）。
-      // 自定义 op（__fn）也走缓存 —— 我们无法判断它是否纯，**宁可多缓存**：
-      // 不缓存而结果漂移 ⇒ 前缀改变 ⇒ 付断点税（比多占几 KB 磁盘贵得多）。
-      const opName = op.__fn === undefined ? op.op : `custom:${op.op}`
+      /**
+       * 缓存判据 = **"能否证明这个 op 是纯函数"**，而不是按 op 名硬编码：
+       *   纯 op（keep/extract/… 含 inline 的前四种 form）本来可复现，缓存只白占磁盘；
+       *   其余（exec / http / inline.code / 自定义注入）一律进缓存 —— 结果漂移 ⇒ 前缀改变
+       *   ⇒ 付断点税（比多占几 KB 磁盘贵得多，所以**宁可多缓存**）。
+       */
+      const inlineCode = op.op === 'inline' && (op.use ?? 'stdout') === 'code'
+      const provablyPure = op.__fn === undefined && PURE_OPS.has(op.op) && !inlineCode
       const useCache = Boolean(ctx.cache?.enabled) && op.cache !== false && typeof out === 'string'
-        && (CACHED_OPS.has(op.op) || op.__fn !== undefined)
+        && !provablyPure
       const key = useCache ? ctx.cache.keyOf(op, out, ctx) : null
       if (useCache) {
         const hit = ctx.cache.get(key)
@@ -657,6 +913,8 @@ export function apply(ctx, config = {}) {
    * 那些参数都在热配置文件里。
    */
   const opCache = createOpCache(cfg, log)
+  /** `inline.code` 的编译缓存（按源码串缓存，改源码即失效）。 */
+  const inlineCodeCache = new Map()
   const baseOpCtx = {
     stubTemplate: cfg.stubTemplate,
     opTimeoutMs: cfg.opTimeoutMs ?? 8000,
@@ -665,6 +923,7 @@ export function apply(ctx, config = {}) {
     spawn: cfg.spawn,
     redact: cfg.redact,
     cache: opCache,
+    compileInline: (body) => compileInline(body, inlineCodeCache),
     log,
   }
 
@@ -675,15 +934,20 @@ export function apply(ctx, config = {}) {
    *
    * ⚠️ **本机实测过的一个陷阱**：用 `ops` 注入函数 ⇒ patch 里必须出现 `config:` 行 ⇒
    * `dshmarket/lib/hot.js:295` 判定为"含配置行"⇒ **不能热挂载**（只能重启生效）。
-   * 所以自定义函数的代价是"放弃热插拔"，请按需权衡；纯内置 op 的用法不受影响。
+   * 所以自定义函数的代价是"放弃热插拔"。**想两者都要就用 `inline.code`** ——
+   * 它是**源码字符串**，可以写在热配置文件里 ✓。
    */
   const customOps = { ...(cfg.ops ?? {}) }
-  /** 解析一个 op 名 → 实现函数：自定义优先，其次内置。 */
+  /**
+   * 解析一个 op 名 → 实现函数：用户自定义 → 内置（含统一协议名）→ 旧名别名。
+   * 旧名（`python` / `summarize`）只是"预填参数的别名"，走同一套实现 ⇒ 缓存与失败语义一致。
+   */
   const resolveOpFn = (name) => {
     const custom = customOps[name]
     if (typeof custom === 'function') return custom
     if (typeof custom === 'string' && typeof OPS[custom] === 'function') return OPS[custom]
-    return OPS[name]
+    if (typeof OPS[name] === 'function') return OPS[name]
+    return DEPRECATED_OPS[name]
   }
   /**
    * 把策略里的 op 名换成**已解析的实现**，再交给 applyOps。

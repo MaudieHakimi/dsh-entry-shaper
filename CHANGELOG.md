@@ -2,6 +2,59 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与语义化版本。
 
+## [1.0.0] — 2026-09-23
+
+**统一协议：外部塑形不再按"是什么类型"硬编码，而是按"传输 × 数据格式"两维组织。**
+
+### Changed（破坏性）
+
+- **`python` / `summarize` 不再是"类型"，而是别名**。op 名只表示**传输方式**：
+  - `exec` —— 任何本地命令（`python` / `node` / `pwsh` / 你自己的 exe）。
+    数据格式由 `protocol` 决定：`json`（默认，信封 JSON）｜`text`｜`lines`｜`argv`。
+    新增 `cwd` / `env`；`args` 支持 `{}`（脚本路径）与 `{text}`（待塑形文本）占位符；
+    `argv` 协议**完全不碰 stdin**。
+  - `http` —— 任何 HTTP 端点。新增：`url`（完整端点）、`method`、`headers`、`instruction`
+    （追加第二条 system 消息）、`body`（**整包覆盖**请求体，`{{text}}` 占位符 ⇒ 可接
+    非 OpenAI 形状的服务）、`protocol: text`。
+    响应解析按序尝试 `choices[0].message.content` → `text` → `output` → `content` → `data`
+    → 响应原文 ⇒ 多数兼容服务不改配置即可用。
+  - `inline` —— **进程内**算法（不必写脚本、不必起进程）：`use: stdout | firstLine |
+    jsonField | regex | code`。
+- **统一信封与返回值**（写进 README 与 `examples/custom-op.md`）：
+  输入 `{ text, kind, meta, op, protocol: 1 }`（`protocol` 是版本号）；
+  返回值三种形态 —— JSON 含字符串 `text` ⇒ 用它；含 `"text": null` ⇒ 整块删除；
+  其它字符串 ⇒ 取原文。失败只跳过该 op（fail-open）。
+- **缓存判据改成"能否证明是纯函数"**（`PURE_OPS` 白名单 + `inline.code` 例外），
+  不再按 op 名硬编码 `CACHED_OPS`。后果：自定义 op 与 `inline.code` 一律进缓存 ——
+  无法证明纯就不赌，因为"结果漂移 ⇒ 前缀改变 ⇒ 付断点税"比多占磁盘贵得多。
+- **`inline.code` 让"进程内自定义算法"也能热改**：`code` 是**函数体源码字符串**
+  （`new Function` 编译并按源码缓存）⇒ 可以写在热配置文件里，
+  不必像 `config.ops` 注入函数那样因 patch 出现 `config:` 行而失去热挂载。
+
+### Added
+
+- `parseShaped()`（导出）：把外部结果按统一规则解析为文本 / `null`。
+- `DEPRECATED_OPS`（导出）：旧名 `python` / `summarize` 的等价别名，走同一套实现
+  ⇒ 缓存与失败语义完全一致。**旧配置继续可用**。
+
+### Fixed
+
+- 实现过程中被既有测试抓住的两个真问题（都不是新写的测试发现的，说明原套件有效）：
+  ① 新 `http` 一度丢了 `ctx.llm.baseURL` 回退链；
+  ② `summarize` 别名一度预填 `baseURL`，把 `ctx.llm.baseURL` **短路**掉
+  （测试注入的端点被忽略、请求打到官方端点）。
+- `inline.code` 的 `code` 参数类型变了（现在是字符串，不再是函数）—— 属破坏性变更，
+  但该 form 是本版新增的，无既有用户。
+
+### 测试 79/79
+
+新增 12 例：`exec` 用 node（不再是 python 专用）、信封字段完整（含 `protocol: 1`）、
+`argv` 不碰 stdin、`lines` 送 kind、`{text:null}` 删除、退出码非 0 只跳过该 op、
+`env`/`cwd` 生效（并注明 Windows 上环境变量叫 `Path` 不是 `PATH`）、`http` 自定义 `body`、
+`instruction` 追加 system、`inline` 三种 form、`inline.code` 走缓存、旧名与统一协议等价。
+另修 5 个旧 mock：统一协议下 `http` 会先取响应**原文**，只实现 `json()` 的旧 mock 会让 op
+抛错并被 fail-open 跳过（表现为"返回原文"，像功能坏了）—— 已在测试文件里标注这个坑。
+
 ## [0.9.6] — 2026-09-23
 
 **自定义算法真正可用了 + 文档补上"怎么配上去"（此前 README 只有一张名词表）。**

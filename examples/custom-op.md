@@ -1,12 +1,29 @@
-# 接入你自己的算法
+# 接入你自己的算法（统一协议）
 
-三种方式，**从简单到复杂**。先用 ①，不够再往下走。
+**op 名只表示"传输方式"，不表示"这是 .py / 这是 LLM"。**
+python / node / pwsh / 你自己的 exe 都走 `exec`；任何 OpenAI 兼容端点都走 `http`；
+进程内小逻辑走 `inline`。三者共用同一套信封与返回规则。
+
+```
+输入信封（每次调用必送）
+  { "text": "<待塑形文本>", "kind": "reasoning|toolResult|toolArgs|assistantText",
+    "meta": { }, "op": "exec", "protocol": 1 }
+
+返回值（三种形态都接受，按序判定）
+  1. JSON 对象含字符串 text  ⇒ 用它
+  2. JSON 对象含 "text": null ⇒ 整块删除
+  3. 其它任何字符串           ⇒ 取原文（trim 后）
+
+失败（退出码≠0 / 超时 / 输出空 / 抛错）⇒ 只跳过该 op，保留上一步结果
+```
+
+`protocol: 1` 是协议版本号 —— 脚本可据此判断解析方式（未来不兼容变更时会递增）。
 
 ---
 
-## ① 组合内置 op（推荐先试）
+## ① 组合内置 op（先用这个）
 
-不需要写任何代码。改 `~/.dsh-entry-shaper.config.json` 的 `policy` 即可，**改完立即生效**：
+不用写代码，改 `~/.dsh-entry-shaper.config.json` 即可，**改完立即生效**：
 
 ```jsonc
 {
@@ -19,68 +36,138 @@
 }
 ```
 
-op 是 `文本 → 文本`，链式连接，前一个的输出是后一个的输入。参数全集见 README 的
-「可用 op（参数全集）」。
-
 ---
 
-## ② 外部脚本（`python` op）—— 任意语言，也能热改
+## ② `exec`：任何命令（任意语言）
 
-**协议**（`protocol: "json"`，默认）：stdin 收一行 JSON，stdout 回一行 JSON。
+### Python
 
 ```python
-# D:/shaper/my_shaper.py
+# D:/shaper/mine.py
 import json, sys
 
-req = json.loads(sys.stdin.readline())
-text = req["text"]          # 待塑形文本
-kind = req["kind"]          # "reasoning" | "toolResult" | "toolArgs" | "assistantText"
-meta = req["meta"]          # 预留
+# ⚠️ Windows 上务必显式指定 UTF-8：
+#    Python 往**管道**写非 ASCII 时默认用系统代码页（GBK/cp936），插件按 utf8 解码
+#    ⇒ 中文全变 ????（实测踩到）。两条修法任选：
+#      ① 插件已替 python 自动设好 PYTHONIOENCODING=utf-8（可被你的 env 覆盖）
+#      ② 脚本自己写死，最稳妥：
+sys.stdout.reconfigure(encoding="utf-8")
+sys.stdin.reconfigure(encoding="utf-8")
 
-# ── 你的算法在这里 ──
-out = text[:200]
+req = json.loads(sys.stdin.readline())   # 信封
+text, kind = req["text"], req["kind"]
+
+out = text[:200]                         # ── 你的算法 ──
 
 print(json.dumps({"text": out}, ensure_ascii=False))
 ```
 
-配置：
+> 注：`python -X utf8` **不能**解决这个问题（那条只管源码与文件，不管管道）。
 
 ```jsonc
-{
-  "policy": {
-    "reasoning": { "ops": [
-      { "op": "python", "script": "D:/shaper/my_shaper.py", "protocol": "json", "timeoutMs": 3000 }
-    ] }
-  }
-}
+{ "op": "exec", "command": "python", "script": "D:/shaper/mine.py" }
+```
+
+### Node
+
+```js
+// D:/shaper/mine.mjs
+let raw = ''
+for await (const c of process.stdin) raw += c
+const { text, kind } = JSON.parse(raw)
+process.stdout.write(JSON.stringify({ text: text.slice(0, 200) }))
+```
+
+```jsonc
+{ "op": "exec", "command": "node", "args": ["D:/shaper/mine.mjs"] }
+```
+
+### PowerShell / 你自己的 exe / 任何东西
+
+```jsonc
+{ "op": "exec", "command": "pwsh", "args": ["-NoProfile", "-File", "D:/shaper/mine.ps1"] }
+{ "op": "exec", "command": "D:/tools/shaper.exe", "args": ["--mode", "fast"] }
+```
+
+### 数据格式（`protocol`）
+
+| 值 | stdin 收到 | 适合 |
+|---|---|---|
+| `json`（默认） | 一行信封 JSON | 新写的脚本，**推荐** |
+| `text` | 纯文本 | 只想要原文的现成工具 |
+| `lines` | 第一行 = `kind`，其余 = 文本 | shell 友好的轻量写法 |
+| `argv` | **不写 stdin**；文本作为**最后一个命令行参数** | 不接受 stdin 的现成程序 |
+
+> `argv` 想自己决定文本在参数里的位置，就在 `args` 里写 `{text}` 占位符
+> （注意：用了占位符**同时**也会自动追加一次 ⇒ 想只出现一次就别用占位符）。
+> 另外命令行有长度上限（Windows 约 32K 字符）——长文本请用 stdin 协议。
+
+### 其它参数
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `command` | **必填** | 可执行文件 |
+| `script` | — | 便捷写法：作为第一个参数。`args` 里的 `{}` 会被替换成它 |
+| `args` | `[]` | 参数数组 |
+| `cwd` | 进程当前目录 | 工作目录 |
+| `env` | — | **追加**的环境变量（与 `process.env` 合并，不是替换） |
+| `timeoutMs` | 全局 `opTimeoutMs` | 超时即 kill 并跳过该 op |
+
+调试技巧：脚本可以单独跑 —— `echo '{"text":"hello","kind":"reasoning"}' | python mine.py`。
+
+> **会进缓存**：同一输入的结果记在 `~/.dsh-entry-shaper.cache.jsonl`
+> （键 = 配置指纹 + op 参数 + 输入）。这是刻意的 —— 结果每次不同 ⇒ 出网前缀改变
+> ⇒ 付断点税（比磁盘贵得多）。改了脚本请同时改一个参数或清缓存。
+
+---
+
+## ③ `http`：任何 OpenAI 兼容端点
+
+```jsonc
+// 标准形状：system 提示词 + 待塑形文本作为 user 消息
+{ "op": "http", "baseURL": "https://api.deepseek.com", "model": "deepseek-flash",
+  "system": "压成 3 行要点，保留路径与数字。", "maxTokens": 200 }
+
+// 追加一条微调指令（作为第二条 system 消息）
+{ "op": "http", "url": "https://gateway/v1/chat/completions", "system": "…", "instruction": "再简短些" }
+
+// 非 OpenAI 形状的服务：body 整包覆盖（{{text}} 会被替换成待塑形文本）
+{ "op": "http", "url": "https://my.example/shaper", "body": { "input": "{{text}}", "mode": "fast" } }
 ```
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `script` | **必填** | 脚本路径 |
-| `command` | `python` | 解释器（Windows 上可能是 `python` / `py` / 绝对路径） |
-| `args` | `[]` | 追加到脚本路径之后的参数 |
-| `protocol` | `json` | `json` ⇒ stdin 收 `{"text","kind","meta"}`；`text` ⇒ stdin 收纯文本 |
-| `timeoutMs` | `8000` | 超时即 kill 并跳过该 op |
+| `url` | — | 完整端点（原样使用） |
+| `baseURL` | `ctx.llm.baseURL` → DeepSeek 官方 | 自动补 `/chat/completions` |
+| `system` | 内置中文提示词 | 系统提示词（旧名 `prompt` 等价） |
+| `instruction` | — | 追加的第二条 system 消息 |
+| `apiKey` | `ctx.llm.apiKey` → `DEEPSEEK_API_KEY` | Bearer 令牌 |
+| `model` / `maxTokens` / `temperature` / `headers` / `method` | — | 请求控制 |
+| `body` | — | **整包覆盖**请求体（此时上面的形状参数全部忽略） |
+| `protocol` | `json` | `text` ⇒ 响应体当纯文本 |
 
-输出约定：`{"text": "…"}` 取该字段；否则取 stdout 原文（trim 后）。
-**退出码 ≠ 0 / 超时 / 输出为空 ⇒ 跳过该 op**（fail-open，保留上一步结果）。
-
-调试技巧：脚本可以单独跑 —— `echo '{"text":"hello","kind":"reasoning"}' | python my_shaper.py`。
-
-> **会进缓存**：同一输入的结果被记在 `~/.dsh-entry-shaper.cache.jsonl`
-> （键 = 配置指纹 + op 参数 + 输入）。这是刻意的 —— 脚本结果若每次不同，
-> 出网前缀就会变 ⇒ 付断点税（比磁盘贵得多）。改了脚本请同时改一个参数或清缓存。
+响应解析顺序（`json` 协议）：`choices[0].message.content` → `text` → `output` → `content`
+→ `data` → 响应原文。**大多数兼容服务不改配置就能用。**
 
 ---
 
-## ③ 注入 JS 函数（`config.ops`）
+## ④ `inline`：进程内算法（不起进程）
 
-在进程内跑，不开子进程。**代价：失去热挂载能力**（原因见最后一节）。
+```jsonc
+{ "op": "inline", "use": "firstLine", "maxLines": 3 }
+{ "op": "inline", "use": "jsonField", "field": "a.b.c" }
+{ "op": "inline", "use": "regex", "pattern": "id=(\\d+)", "template": "#$1" }
+{ "op": "inline", "use": "code", "code": "return text.split('\\n').slice(-5).join('\\n')" }
+```
 
-### 写法
+`use: "code"` 的 `code` 是**函数体源码字符串**（可用 `text` / `op` / `ctx`，用 `return` 返回）
+⇒ 能写进热配置文件 ⇒ **改算法不用重启** ✓。它无法被证明是纯函数，因此**总是走缓存**。
 
-在 `cordis.patch.yml` 给这一行加 `config`：
+---
+
+## ⑤ `config.ops`：注入 JS 函数（进程内，但**要重启**）
+
+在 `cordis.patch.yml` 里给这一行加 `config`：
 
 ```yaml
 - insert:
@@ -88,52 +175,32 @@ print(json.dumps({"text": out}, ensure_ascii=False))
       name: dsh-entry-shaper
       config:
         ops:
-          # 自定义 op：签名 (text, op, ctx) => string | null，可以是 async
           shout: !<tag:yaml.org,2002:js/function> |-
             function (text) { return '!!!' + String(text).slice(0, 4) + '!!!' }
-          # 把名字映射到内置 op（纯字符串，连函数都不需要）
-          myalias: extract
+          myalias: extract        # 纯字符串：把名字映射到内置 op（连函数都不用注入）
 ```
 
-然后 `policy` 里用这个名字（`policy` 仍然放在热配置文件里 ✓）：
+`policy` 里照常写 `{ "op": "shout" }`（仍放热配置文件 ✓）。
 
-```jsonc
-{ "policy": { "reasoning": { "ops": [{ "op": "shout" }] } } }
-```
-
-### 如果你更愿意写文件而不是内联 YAML
-
-把函数放成一个模块，再用 YAML 的 `!js` 标签引用（具体标签名以你的 DSH 加载器支持为准；
-本机的 profile 层已在使用这种自定义标签，例如 `dsh-better-sidebar` 的 patch）：
-
-```yaml
-        ops:
-          mine: !<tag:yaml.org,2002:js/function> |-
-            function (text, op, ctx) {
-              // ctx 里可用：stubTemplate / opTimeoutMs / log / cache / fetch / spawn / redact
-              return String(text).split('\n')[0]
-            }
-```
-
-### 函数契约（必须遵守）
+### 函数契约
 
 | 约定 | 说明 |
 |---|---|
 | 返回 `string` | 作为该 op 的输出，交给链上下一个 op |
-| 返回 `null` | 表示**整块删除**（**推理块例外**：内核会退回短桩，否则 API 会 400） |
-| 抛错 / 超时 | 该 op 被跳过，保留上一步结果（fail-open）⇒ 最坏是"没省到" |
-| **必须确定** | 同一输入**必须**产出同一输出，否则前缀会变 ⇒ 付断点税。做不到就靠缓存（自动） |
-| 名字要唯一 | 缓存键里只有**名字与参数**，函数体无法进键 ⇒ **不同实现请用不同名字** |
+| 返回 `null` | 整块删除（**推理块例外**：内核退回短桩，否则 API 会 400） |
+| 抛错 / 超时 | 该 op 被跳过，保留上一步结果（fail-open） |
+| **必须确定** | 同一输入必须同一输出，否则前缀会变 ⇒ 付断点税。做不到就靠缓存（自动） |
+| **名字要唯一** | 缓存键里只有名字与参数，函数体进不了键 ⇒ **不同实现用不同名字** |
 
 ### 为什么它会牺牲热挂载
 
-`dshmarket/lib/hot.js:295` 明确规定：**bundle patch 含配置行/表达式 ⇒ 不能热挂载，
-只能重启生效**。而注入函数必须往 patch 里写 `config:` ⇒ 就落进了这一条。
+`dshmarket/lib/hot.js:295`：**bundle patch 含配置行/表达式 ⇒ 不能热挂载，只能重启生效**。
+注入函数必须往 patch 写 `config:` ⇒ 落进这一条。
 
 | 你用了什么 | 热挂载 | 改配置要重启吗 |
 |---|---|---|
-| 只改 `~/.dsh-entry-shaper.config.json`（含 ② 的全部参数） | ✅ 可以 | ❌ 不用 |
-| patch 里写了 `config:`（③，或 `ctx.llm` / `ctx.redact` / `ctx.fetch` / `ctx.spawn`） | ❌ 不行 | ✅ 要重启 |
+| 只改 `~/.dsh-entry-shaper.config.json`（含 ①②③④ 全部参数） | ✅ 可以 | ❌ 不用 |
+| patch 里写了 `config:`（⑤，或 `ctx.llm` / `ctx.redact` / `ctx.fetch` / `ctx.spawn`） | ❌ 不行 | ✅ 要重启 |
 
-**同一件事有两种干法时，优先选不需要 `config:` 的那种**（例如让 `summarize` 用 op 自己的
-`baseURL` / `model` / `apiKey` 参数，而不是 `ctx.llm`）。
+**同一件事能用前四条做，就别用第五条。** 例：让 `http` 用自己的 `baseURL` / `model` /
+`apiKey` 参数（在热配置文件里 ✓），而不是 `ctx.llm`。

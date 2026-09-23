@@ -41,5 +41,18 @@
   "lagWarnMs": 2000,
   "stubTemplate": "[reasoning omitted: {chars} chars]",
   "dropUsageOnReplace": true,
-  "logStats": true
+  "logStats": true,
+
+  "_注释": [
+    "policy 的每一类都是一条 op 链（文本 → 文本）。op 名只表示传输方式：",
+    "  exec   = 任何本地命令（python / node / pwsh / 你的 exe），数据格式由 protocol 决定",
+    "  http   = 任何 OpenAI 兼容端点（system 是系统提示词，body 可整包覆盖）",
+    "  inline = 进程内算法（firstLine / jsonField / regex / code）",
+    "  keep/drop/stub/extract/head/tail/truncate = 纯 op（只挑内容，不改结构）",
+    "示例（把下面任意一条填进对应类别的 ops 即可）：",
+    "  { \"op\": \"exec\", \"command\": \"python\", \"script\": \"D:/shaper/mine.py\" }",
+    "  { \"op\": \"http\", \"system\": \"压成 3 行要点，保留路径与数字。\", \"maxTokens\": 200 }",
+    "  { \"op\": \"inline\", \"use\": \"code\", \"code\": \"return text.split('\\\\n').slice(-5).join('\\\\n')\" }",
+    "完整说明见 README 的「统一协议」一节与 examples/custom-op.md"
+  ]
 }

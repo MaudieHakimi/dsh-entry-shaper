@@ -19,7 +19,7 @@
 - [安装](#安装)
 - [配置](#配置)
 - [三种挂载方式](#三种挂载方式)
-- [可用 op](#可用-op)
+- [统一协议：一切外部塑形都走同一套 I/O 约定](#统一协议一切外部塑形都走同一套-io-约定)
 - [栈护栏](#栈护栏)
 - [实测数据](#实测数据)
 - [现状与限制](#现状与限制)
@@ -152,94 +152,174 @@ dsh plugin --profile web add "file:D:\plugins\dsh-entry-shaper"
 2. 热挂载条目的 id 是 `mkt-<原id>`，与 patch 层的 `- id: <原id>` **不是同一个条目**
    ⇒ patch 层的 `disabled: true` 管不住热挂载实例。
 
-## 可用 op（参数全集）
+## 统一协议：一切外部塑形都走同一套 I/O 约定
 
-每个 op 都是 `文本 → 文本`。`返回 null` 表示"整块删除"。**未列出的参数一律忽略**。
+**op 名只表示"传输方式"，不表示"这是 .py / 这是 LLM"**。任何语言、任何命令、任何
+OpenAI 兼容端点，都通过同一套信封与返回规则接入 —— 这是本插件唯一的扩展接口。
 
-| op | 参数 | 默认 | 说明 |
-|---|---|---|---|
-| `keep` | — | — | 原样返回（默认策略） |
-| `drop` | — | — | 返回 `null` ⇒ 整块删除（**推理块例外**：内核会退回短桩，见下） |
-| `stub` | — | — | 用 `ctx.stubTemplate`｜默认 `[reasoning omitted: {chars} chars]`，`{chars}` 替换为原字符数 |
-| `extract` | `maxChars`<br>`marker` | `240`<br>`true` | 只留"决策句"（以 `I'll / let me / next / 然后 / 我先…` 开头）。`marker: false` 去掉 `[reasoning extract: N chars omitted]` 前缀 |
-| `head` | `chars` | `512` | 保留**前** N 个字符 |
-| `tail` | `chars` | `512` | 保留**后** N 个字符 |
-| `truncate` | `maxChars` | `512` | 首尾各留一半、中间折叠成 `…（省略 N 字符）…` |
-| `python` | `script` **必填**<br>`command`<br>`args`<br>`protocol`<br>`timeoutMs` | —<br>`python`<br>`[]`<br>`json`<br>`8000` | 起外部进程。`protocol: json` ⇒ stdin 收一行 `{"text","kind","meta"}`，stdout 回 `{"text"}` 或纯文本；`protocol: text` ⇒ stdin 收纯文本。退出码≠0 / 超时 / 输出空 ⇒ 跳过该 op |
-| `summarize` | `prompt`<br>`baseURL`<br>`model`<br>`maxTokens`<br>`apiKey` | 内置中文提示词<br>`https://api.deepseek.com`<br>`deepseek-flash`<br>`256`<br>`DEEPSEEK_API_KEY` | `POST {baseURL}/chat/completions`，`temperature: 0` |
+```
+                        传输（transport）
+        ┌──────────────────┬──────────────────┬─────────────────┐
+   exec │ 本地进程          │ http │ 任何 HTTP   │ inline │ 进程内 │
+        │ python/node/pwsh │      │ 端点        │        │ 纯算法 │
+        │ /你的 exe        │      │             │        │        │
+        └──────────────────┴──────────────────┴─────────────────┘
+                 ↕ 数据格式（protocol）
+        json │ text │ lines │ argv        （exec 用；http 用 json/text）
+```
 
-**每个 op 还可以带**：`timeoutMs`（覆盖该 op 的超时）、`cache: false`（**非纯 op 别关** —— 见下）。
+### 输入信封（每次调用必送）
+
+```json
+{ "text": "<待塑形文本>", "kind": "reasoning|toolResult|toolArgs|assistantText",
+  "meta": { }, "op": "exec", "protocol": 1 }
+```
+
+`protocol: 1` 是**协议版本号** —— 你的脚本可以据此判断该怎么解析。
+
+### 返回值（三种形态都接受，按序判定）
+
+| # | 你输出什么 | 插件怎么理解 |
+|---|---|---|
+| 1 | JSON 对象含字符串 `text` | 用这个 `text` |
+| 2 | JSON 对象含 `"text": null` | **整块删除** |
+| 3 | 其它任何字符串 | 取原文（trim 后） |
+
+**失败只跳过该 op**（退出码≠0 / 超时 / 输出空 / 抛错）⇒ 保留上一步结果。
+
+### `exec`：任何命令
+
+```jsonc
+{ "op": "exec", "command": "python", "script": "D:/shaper/mine.py" }
+{ "op": "exec", "command": "node",   "args": ["D:/shaper/mine.mjs"] }
+{ "op": "exec", "command": "pwsh",   "args": ["-File", "D:/shaper/mine.ps1"] }
+{ "op": "exec", "command": "D:/tools/shaper.exe", "args": ["--mode", "fast"] }
+```
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `command` | **必填** | 可执行文件（python / node / pwsh / 你的 exe） |
+| `script` | — | 便捷写法：作为第一个参数。`args` 里的 `{}` 会被替换成它 |
+| `args` | `[]` | 参数数组；`{text}` 会被替换成待塑形文本（仅 `argv` 协议需要） |
+| `protocol` | `json` | 输入格式，见下 |
+| `cwd` / `env` | — | 工作目录 / **追加**的环境变量（与 `process.env` 合并） |
+| `timeoutMs` | 全局值 | 超时即 kill 并跳过 |
+
+| `protocol` | stdin 收到 | 适合 |
+|---|---|---|
+| `json` | 一行信封 JSON | 新写的脚本（**推荐**） |
+| `text` | 纯文本 | 只想要原文的现成工具 |
+| `lines` | 第一行 = `kind`，其余 = 文本 | shell 友好的轻量写法 |
+| `argv` | **不写 stdin**，文本作为最后一个命令行参数 | 不接受 stdin 的现成程序（注意命令行长度上限） |
+
+> ⚠️ **Windows 上的 Python 中文乱码**：Python 往管道写非 ASCII 时默认用系统代码页
+> （GBK/cp936），插件按 utf8 解码 ⇒ 中文变 `????`。**插件已替 `python` 自动设好
+> `PYTHONIOENCODING=utf-8`**（你在 `env` 里给同名键即可覆盖），但脚本里自己写一句
+> `sys.stdout.reconfigure(encoding="utf-8")` 更稳妥。注意 `python -X utf8` **不能**解决
+> 这个问题（那条只管源码与文件，不管管道）。
+
+### `http`：任何 OpenAI 兼容端点
+
+```jsonc
+// 标准 OpenAI 形状：system 提示词 + 待塑形文本作为 user 消息
+{ "op": "http", "baseURL": "https://api.deepseek.com", "model": "deepseek-flash",
+  "system": "压成 3 行要点，保留路径与数字。", "maxTokens": 200 }
+
+// 追加一条微调指令（作为第二条 system 消息）
+{ "op": "http", "url": "https://gateway/v1/chat/completions", "system": "…", "instruction": "再简短些" }
+
+// 非 OpenAI 形状的服务：body 整包覆盖（{{text}} 会被替换成待塑形文本）
+{ "op": "http", "url": "https://my.example/shaper", "body": { "input": "{{text}}", "mode": "fast" } }
+```
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `url` | — | 完整端点（给了它就原样使用） |
+| `baseURL` | `ctx.llm.baseURL` → DeepSeek 官方 | 自动补 `/chat/completions` |
+| `system` | 内置中文提示词 | **系统提示词**（旧名 `prompt` 仍可用） |
+| `instruction` | — | 追加的第二条 system 消息（微调用） |
+| `apiKey` | `ctx.llm.apiKey` → `DEEPSEEK_API_KEY` | Bearer 令牌 |
+| `model` / `maxTokens` / `temperature` / `headers` / `method` | — | 常规请求控制 |
+| `body` | — | **整包覆盖**请求体（接非 OpenAI 形状时用） |
+| `protocol` | `json` | `text` ⇒ 响应体当纯文本 |
+
+响应解析（`json` 协议）按序尝试：`choices[0].message.content` → `text` → `output` → `content`
+→ `data` → 响应原文。**所以大多数兼容服务不用改配置就能用。**
+
+### `inline`：进程内算法（不必写脚本、不必起进程）
+
+```jsonc
+{ "op": "inline", "use": "firstLine", "maxLines": 3 }          // 只留前 3 行
+{ "op": "inline", "use": "jsonField", "field": "a.b.c" }        // 从 JSON 里取字段
+{ "op": "inline", "use": "regex", "pattern": "id=(\\d+)", "template": "#$1" }
+{ "op": "inline", "use": "code", "code": "return text.split('\\n').slice(-5).join('\\n')" }
+```
+
+`use: "code"` 的 `code` 是**函数体源码字符串**（可用 `text` / `op` / `ctx`，`return` 结果）
+⇒ **能写进热配置文件 ⇒ 改算法不用重启** ✓。它无法被证明是纯函数，因此**总是走缓存**。
+
+### 纯 op：不改结构，只挑内容
+
+| op | 参数 | 说明 |
+|---|---|---|
+| `keep` | — | 原样（默认） |
+| `drop` | — | 整块删除（**推理块例外**：内核退回短桩，见下） |
+| `stub` | — | 用 `stubTemplate`，默认 `[reasoning omitted: {chars} chars]` |
+| `extract` | `maxChars`(240)<br>`marker`(true) | 只留决策句；`marker:false` 去掉省略前缀 |
+| `head` / `tail` | `chars`(512) | 保留前 / 后 N 字符 |
+| `truncate` | `maxChars`(512) | 首尾各半 + `…（省略 N 字符）…` |
+
+**每个 op 都可以带** `timeoutMs`（覆盖超时）与 `cache: false`（**非纯 op 别关**）。
 
 ### 复制即用的配置片段
-
-下面全部是 `~/.dsh-entry-shaper.config.json` 里 `policy` 的写法（改完**立即生效，不用重启**）：
 
 ```jsonc
 // ① 默认：推理只留决策句（最省，也最有损）
 "reasoning": { "ops": [{ "op": "extract", "maxChars": 240 }] }
-
-// ② 保守：保留推理的真实开头（不按句式挑，模型更"接得上"）
+// ② 保守：保留推理的真实开头（不按句式挑，模型更容易接上）
 "reasoning": { "ops": [{ "op": "head", "chars": 800 }] }
-
-// ③ 更省：先抽取，再兜底截断（两道闸）
+// ③ 两道闸：先抽取再兜底截断
 "reasoning": { "ops": [{ "op": "extract", "maxChars": 400 }, { "op": "truncate", "maxChars": 300 }] }
-
-// ④ 完全不动推理（省的就只剩别的类别）
+// ④ 完全不动推理
 "reasoning": { "ops": [{ "op": "keep" }] }
-
-// ⑤ 工具结果：超大输出只留首尾（注意官方 tool-result-pruner 已在做，别重复）
+// ⑤ 工具结果只留首尾（注意官方 tool-result-pruner 已在做，别重复）
 "toolResult": { "ops": [{ "op": "truncate", "maxChars": 1024 }] }
-
-// ⑥ 外部脚本（你自己的算法）：脚本路径 + 协议
-"reasoning": { "ops": [{ "op": "python", "script": "D:/shaper/my_shaper.py", "protocol": "json", "timeoutMs": 3000 }] }
-
-// ⑦ 让 LLM 来压（OpenAI 兼容端点 + 显式提示词）
-"reasoning": { "ops": [{ "op": "summarize", "prompt": "压成 3 行要点，保留路径与数字。", "maxTokens": 200 }] }
+// ⑥ 你自己的脚本（任何语言）
+"reasoning": { "ops": [{ "op": "exec", "command": "python", "script": "D:/shaper/mine.py" }] }
+// ⑦ 让 LLM 来压
+"reasoning": { "ops": [{ "op": "http", "system": "压成 3 行要点，保留路径与数字。", "maxTokens": 200 }] }
+// ⑧ 进程内自定义算法（免重启）
+"reasoning": { "ops": [{ "op": "inline", "use": "code", "code": "return text.split('\\n').slice(-5).join('\\n')" }] }
 ```
 
-### 接自己的算法：三种方式
+### 旧名（仍可用，但不建议新写）
 
-| 方式 | 怎么写 | 能热改吗 | 适合 |
+`python` 是 `exec` 的别名（预填 `command: "python"`），`summarize` 是 `http` 的别名
+（`prompt` 即 `system`）。两者走**同一套实现** ⇒ 缓存与失败语义完全一致。
+它们存在的唯一理由是兼容旧配置；新配置请直接用 `exec` / `http`。
+
+op 可任意链式组合，**可以是 async**，统一受 `opTimeoutMs`（默认 8s）约束：超时或抛错
+⇒ **只跳过该 op**、保留上一步结果（fail-open）—— 最坏情况是"没省到"，绝不会挂住会话。
+未知 op 名同样被跳过（拼错名字不会让整条链失效）。
+
+### 接自己的算法：三条路怎么选
+
+| 方式 | 写法 | 能热改吗 | 适合 |
 |---|---|---|---|
-| **① 组合内置 op** | `"ops": [{ "op": "extract" }, { "op": "truncate", "maxChars": 300 }]` | ✅ 改配置文件即可 | 大多数场景。先用这个，别急着写代码 |
-| **② 外部脚本**（`python` op） | 脚本读 stdin、写 stdout；`{"op":"python","script":"…","protocol":"json"}` | ✅ 改配置文件即可 | 任意语言的算法；调试方便（可单独跑脚本） |
-| **③ 注入 JS 函数**（`config.ops`） | 见下 | ❌ **需重启**（原因见下） | 不想起子进程、要在进程内跑 |
+| **组合内置 op** | `[{ "op": "extract" }, { "op": "truncate" }]` | ✅ | 大多数场景，先用这个 |
+| **`exec` 外部脚本** | 任何语言，读 stdin / 写 stdout | ✅ | 任意算法；可单独调试 |
+| **`inline.code`** | 函数体源码写在配置里 | ✅ | 不想起进程的小逻辑 |
+| **`config.ops` 注入函数** | patch 里写 `config.ops` | ❌ 需重启 | 需要进程内状态/依赖时 |
 
-**方式 ③ 的写法** —— 在 `cordis.patch.yml` 里给这一行加 `config`：
-
-```yaml
-- insert:
-    - id: dsh-entry-shaper
-      name: dsh-entry-shaper
-      config:
-        ops:
-          # 自定义 op：函数签名 (text, op, ctx) => string | null；可以是 async
-          shout: !<tag:yaml.org,2002:js/function> |-
-            function (text) { return '!!!' + String(text).slice(0, 4) + '!!!' }
-          # 也可以只用字符串，把名字映射到内置 op（这个连函数都不用注入）
-          myalias: extract
-```
-
-> ⚠️ **代价（必须知道）**：注入函数 ⇒ patch 里出现了 `config:` 行 ⇒
-> `dshmarket/lib/hot.js:295` 判定为"含配置行"⇒ **本插件失去热挂载能力**（只能重启生效）。
-> 这是"自定义函数"与"热插拔"之间的取舍：**纯内置 op（含方式 ②，它只是配置参数）不受影响** ✓。
+> ⚠️ **注入函数会牺牲热挂载**：patch 出现 `config:` 行 ⇒ `dshmarket/lib/hot.js:295`
+> 判定为"含配置行"⇒ 本插件失去热挂载能力。同一件事能用前三条做就别用第四条。
+> `ctx.llm` / `ctx.redact` / `ctx.fetch` / `ctx.spawn` 同理（函数与凭据写不进 JSON）。
 >
-> ⚠️ `summarize` 的 `ctx.llm`（baseURL / apiKey / model）与**脱敏** `ctx.redact`
-> **只能从 patch 的 `config:` 传入**（函数与凭据无法写进 JSON 配置文件）⇒
-> 要用自定义凭据或脱敏，同样得放弃热挂载。若只是想让 `summarize` 指向你的端点，
-> 直接用 op 自己的 `baseURL` / `model` / `apiKey` 参数即可（那些在热配置文件里）✓。
->
-> ⚠️ **自定义 op 也会进缓存**（`cache: false` 可关）：我们无法判断你的函数是否纯，
-> 而"结果漂移 ⇒ 前缀改变 ⇒ 付断点税"比"多占几 KB 磁盘"贵得多，所以**宁可多缓存**。
-> 因此**请用不同的 op 名字区分不同实现** —— 缓存键里只有**名字与参数**，
-> 函数体本身无法进键（`JSON.stringify` 会丢掉函数）。
+> ⚠️ **自定义 op 也会进缓存**：无法判断你的实现是否纯，而"结果漂移 ⇒ 前缀改变 ⇒ 付断点税"
+> 比"多占几 KB 磁盘"贵得多。**不同实现请用不同的 op 名字** —— 缓存键里只有名字与参数。
 
-op 可任意链式组合，**可以是 async**，统一受 `opTimeoutMs`（默认 8s，可 per-op 覆盖）约束：
-超时或抛错 ⇒ **只跳过该 op**、保留上一步结果（fail-open）—— 最坏情况是"没省到"，
-绝不会挂住会话。未知 op 名同样被跳过（不会因为拼错名字就整条链失效）。
-
-一个**完整可用**的配置文件见 [`examples/config.full.json`](examples/config.full.json)，
-自定义 op 的两种写法见 [`examples/custom-op.md`](examples/custom-op.md)。
+完整配置文件见 [`examples/config.full.json`](examples/config.full.json)，
+接入自定义算法的详解见 [`examples/custom-op.md`](examples/custom-op.md)。
 
 ### 非纯 op 必须缓存（前缀稳定性的前提）
 
