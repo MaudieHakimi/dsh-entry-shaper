@@ -1,0 +1,308 @@
+// 行为分歧基准：把推理桩化，会不会改变模型的"下一步动作"？
+//
+// 做法：从真实会话日志里捞出「工具往返」历史快照，用**同一个前缀**发两次请求——
+//   臂 A（full）：assistant 消息带完整 reasoning_content（= 当前 DSH 的行为）
+//   臂 B（stub）：assistant 消息的 reasoning_content 换成短桩（= 本插件塑形后的行为）
+// 比较两臂产出的"下一步动作"，并与会话里**真实发生的下一步**对照。
+//
+// 为什么必须是 stub 而不是 drop：bench/passback-stub.mjs 实测——thinking 模式下报文以
+// role:'tool' 结果结尾（延续工具回路）时，缺 reasoning_content 会被 400 拒绝
+// （"must be passed back to the API"），而换成短桩后 200 ⇒ API 要的是字段在，不是内容全。
+//
+// 用法：
+//   node bench/divergence.mjs <session.jsonl.zstd> [--cases=8] [--window=2] [--per-turn]
+//                             [--model=deepseek-flash] [--max-tokens=384] [--json]
+import { readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+import { zstdDecompressSync } from 'node:zlib'
+
+const MAGIC = [0x28, 0xb5, 0x2f, 0xfd]
+
+const argv = process.argv.slice(2)
+const file = argv.find((a) => !a.startsWith('--'))
+if (!file) {
+  console.error('用法: node bench/divergence.mjs <session.jsonl.zstd> [--cases=8] [--window=2] [--model=…] [--max-tokens=384] [--json]')
+  process.exit(2)
+}
+const numArg = (name, dflt) => {
+  const hit = argv.find((a) => a.startsWith(`--${name}=`))
+  return hit ? Number(hit.split('=')[1]) : dflt
+}
+const strArg = (name, dflt) => {
+  const hit = argv.find((a) => a.startsWith(`--${name}=`))
+  return hit ? hit.split('=')[1] : dflt
+}
+const CASES = numArg('cases', 8)
+const WINDOW = numArg('window', 2)
+const PER_TURN = argv.includes('--per-turn')
+const MODEL = strArg('model', 'deepseek-flash')
+const MAX_TOKENS = numArg('max-tokens', 384)
+const JSON_OUT = argv.includes('--json')
+const PRICE_HIT = 0.02 / 1e6
+const PRICE_MISS = 1 / 1e6
+
+// ── 凭据（脚本自读，不进命令行）──
+const credText = readFileSync(join(homedir(), '.dsh', '.credentials.yaml'), 'utf8')
+const keyMatch = credText.match(/DEEPSEEK_API_KEY:\s*(\S+)/)
+if (!keyMatch) throw new Error('凭据文件里没有 DEEPSEEK_API_KEY')
+const KEY = keyMatch[1]
+const BASE = process.env.DSH_DEEPSEEK_BASE ?? 'https://api.deepseek.com'
+
+// ── 读会话日志 ──
+const buf = readFileSync(file)
+const magics = []
+for (let i = 0; i + 4 <= buf.length; i++) {
+  if (buf[i] === MAGIC[0] && buf[i + 1] === MAGIC[1] && buf[i + 2] === MAGIC[2] && buf[i + 3] === MAGIC[3]) magics.push(i)
+}
+const values = []
+for (let k = 0; k < magics.length; k++) {
+  const slice = buf.subarray(magics[k], k + 1 < magics.length ? magics[k + 1] : buf.length)
+  for (let j = slice.length; j > 0 && j > slice.length - 4; j--) {
+    let text = null
+    try { text = zstdDecompressSync(slice.subarray(0, j)).toString('utf8') } catch { continue }
+    for (const line of text.split('\n')) {
+      if (!line.startsWith('{')) continue
+      try { values.push(JSON.parse(line)) } catch { /* 半个 JSON */ }
+    }
+    break
+  }
+}
+
+// ── 捞出"轮次"：assistant/message（原始追加）与其后的工具结果 ──
+const events = values.filter((r) => Number.isInteger(r.seq))
+const rounds = []
+const usersByTurn = new Map()
+for (const rec of events) {
+  if (rec.type === 'user/message' && !usersByTurn.has(rec.data?.turn)) {
+    const text = (rec.data?.content ?? []).filter((b) => b?.type === 'text').map((b) => b.text).join('\n')
+    usersByTurn.set(rec.data?.turn, text.slice(0, 4000))
+  }
+}
+let pendingResults = []
+for (const rec of events) {
+  if (rec.type === 'tool/result') {
+    pendingResults.push(rec)
+    continue
+  }
+  if (rec.type !== 'assistant/message') continue
+  if (rec.surfaceOp !== undefined && rec.surfaceOp !== 'append') continue
+  const content = rec.data?.message?.content
+  if (!Array.isArray(content)) continue
+  const reasoning = content.filter((b) => b?.type === 'reasoning').map((b) => b.text ?? '').join('')
+  const text = content.filter((b) => b?.type === 'text').map((b) => b.text ?? '').join('')
+  const calls = content.filter((b) => b?.type === 'tool-call')
+  rounds.push({ turn: rec.data?.turn, step: rec.data?.step, reasoning, text, calls, results: pendingResults })
+  pendingResults = []
+}
+rounds.at(-1).results = pendingResults
+// 配对修正：rounds[i].results 是"出现在 assistant_i 之前"的结果（= 上一轮的响应），
+// 真正**响应 assistant_i 的调用**的是 rounds[i+1].results ⇒ 记作 responses。
+for (let i = 0; i < rounds.length - 1; i++) rounds[i].responses = rounds[i + 1].results
+rounds.at(-1).responses = pendingResults
+
+const usable = rounds.filter((r) => r.calls.length > 0 && (r.responses?.length ?? 0) > 0)
+if (usable.length === 0) {
+  console.error('这个会话里没有可用的"工具往返"轮次')
+  process.exit(1)
+}
+const picked = []
+for (let i = 0; i < CASES; i++) {
+  const idx = Math.floor((usable.length - 1) * (i + 0.5) / CASES)
+  picked.push(usable[idx])
+}
+
+const TOOL_TEXT = (rec) => {
+  const out = []
+  const walk = (v) => {
+    if (Array.isArray(v)) return v.forEach(walk)
+    if (v && typeof v === 'object') {
+      for (const [k, val] of Object.entries(v)) {
+        if (k === 'text' && typeof val === 'string') out.push(val)
+        else if (val && typeof val === 'object') walk(val)
+      }
+    }
+  }
+  walk(rec.data?.message?.content ?? rec.data)
+  return out.join('\n').slice(0, 20000)
+}
+
+/** 构造某轮的请求 messages；mode: 'full'（DSH 现状）| 'stub'（本插件塑形后）。 */
+function buildMessages(windowRounds, { mode }) {
+  const messages = [{
+    role: 'system',
+    content: 'You are a coding agent working in a repository via tools. '
+      + 'Continue the task: decide the next action. Use a tool call when an action is needed.',
+  }]
+  const userText = usersByTurn.get(windowRounds[0].turn)
+  if (userText) messages.push({ role: 'user', content: userText })
+  for (const r of windowRounds) {
+    const assistant = { role: 'assistant', content: r.text ?? '' }
+    if (mode === 'full' && r.reasoning) assistant.reasoning_content = r.reasoning
+    if (mode === 'stub' && r.reasoning) assistant.reasoning_content = `[reasoning omitted: ${r.reasoning.length} chars]`
+    if (r.calls.length > 0) {
+      assistant.tool_calls = r.calls.map((c, i) => ({
+        id: c.id ?? `call_${r.step}_${i}`,
+        type: 'function',
+        function: {
+          name: c.name,
+          arguments: typeof c.arguments === 'string' ? c.arguments : JSON.stringify(c.arguments ?? {}),
+        },
+      }))
+    }
+    messages.push(assistant)
+    for (const res of r.responses ?? []) {
+      for (const block of res.data?.message?.content ?? []) {
+        if (block?.type !== 'tool-result') continue
+        messages.push({ role: 'tool', tool_call_id: block.toolCallId, content: TOOL_TEXT(res) })
+      }
+    }
+  }
+  return messages
+}
+
+const toolsOf = (windowRounds) => {
+  const seen = new Map()
+  for (const r of windowRounds) {
+    for (const c of r.calls) if (!seen.has(c.name)) seen.set(c.name, c)
+  }
+  return [...seen.values()].map((c) => ({
+    type: 'function',
+    function: {
+      name: c.name,
+      description: `Tool ${c.name} (as used in this session).`,
+      parameters: { type: 'object', properties: {}, additionalProperties: true },
+    },
+  }))
+}
+
+const sortKeys = (v) => {
+  if (Array.isArray(v)) return v.map(sortKeys)
+  if (v && typeof v === 'object') {
+    return Object.fromEntries(Object.keys(v).sort().map((k) => [k, sortKeys(v[k])]))
+  }
+  return v
+}
+function canonicalJson(raw) {
+  try {
+    const obj = typeof raw === 'string' ? JSON.parse(raw) : raw
+    return JSON.stringify(sortKeys(obj))
+  } catch {
+    return String(raw).replace(/\s+/g, ' ').trim().slice(0, 400)
+  }
+}
+const normalizeText = (t) => String(t).replace(/\s+/g, ' ').trim().slice(0, 300).toLowerCase()
+
+/** 把一次响应归纳成可比较的"动作"：工具名 + 规范化参数；没有工具调用则退回文本。 */
+function canonicalAction(message) {
+  const calls = message?.tool_calls ?? []
+  if (calls.length > 0) {
+    return calls
+      .map((c) => `${c.function?.name}(${canonicalJson(c.function?.arguments)})`)
+      .sort()
+      .join(' && ')
+  }
+  const raw = Array.isArray(message?.content)
+    ? message.content.map((b) => b?.text ?? '').join(' ')
+    : message?.content ?? ''
+  return `text:${normalizeText(raw)}`
+}
+
+async function call(messages, tools) {
+  const res = await fetch(`${BASE}/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({
+      model: MODEL,
+      stream: false,
+      messages,
+      ...tools.length > 0 ? { tools } : {},
+      temperature: 0,
+      max_tokens: MAX_TOKENS,
+    }),
+  })
+  const text = await res.text()
+  let parsed = null
+  try { parsed = JSON.parse(text) } catch { /* 非 JSON */ }
+  if (!res.ok) return { ok: false, status: res.status, detail: (parsed?.error?.message ?? text).slice(0, 200) }
+  return { ok: true, status: res.status, message: parsed?.choices?.[0]?.message, usage: parsed?.usage }
+}
+
+// ── 跑 ──
+const rows = []
+let totalMiss = 0
+let totalHit = 0
+for (const [i, target] of picked.entries()) {
+  const idx = usable.indexOf(target)
+  const windowRounds = usable.slice(Math.max(0, idx - WINDOW), idx + 1)
+  if (PER_TURN && new Set(windowRounds.map((r) => r.turn)).size > 1) continue
+
+  const tools = toolsOf(windowRounds)
+  const realNext = usable[idx + 1]
+  const realAction = realNext && realNext.turn === target.turn
+    ? canonicalAction({
+      tool_calls: realNext.calls.map((c) => ({ function: { name: c.name, arguments: c.arguments } })),
+      content: realNext.text,
+    })
+    : null
+
+  const a = await call(buildMessages(windowRounds, { mode: 'full' }), tools)
+  const b = await call(buildMessages(windowRounds, { mode: 'stub' }), tools)
+  const actionA = a.ok ? canonicalAction(a.message) : `ERROR:${a.status}`
+  const actionB = b.ok ? canonicalAction(b.message) : `ERROR:${b.status}`
+  for (const r of [a, b]) {
+    if (r.ok && r.usage) {
+      totalMiss += r.usage.prompt_cache_miss_tokens ?? 0
+      totalHit += r.usage.prompt_cache_hit_tokens ?? 0
+    }
+  }
+  rows.push({
+    case: i + 1, turn: target.turn, step: target.step,
+    reasoningChars: target.reasoning.length,
+    same: actionA === actionB,
+    realA: realAction === null ? null : actionA === realAction,
+    realB: realAction === null ? null : actionB === realAction,
+    actionA, actionB, realAction,
+    errA: a.ok ? null : a.detail, errB: b.ok ? null : b.detail,
+  })
+  if (!JSON_OUT) process.stdout.write(`case ${i + 1}/${picked.length} 完成\r`)
+}
+if (!JSON_OUT) process.stdout.write(' '.repeat(30) + '\r')
+
+const counted = rows.filter((r) => !String(r.actionA).startsWith('ERROR') && !String(r.actionB).startsWith('ERROR'))
+const same = counted.filter((r) => r.same).length
+const withReal = counted.filter((r) => r.realA !== null)
+const cost = totalHit * PRICE_HIT + totalMiss * PRICE_MISS
+
+if (JSON_OUT) {
+  console.log(JSON.stringify({ model: MODEL, cases: rows.length, counted: counted.length, same, rows, cost, totalHit, totalMiss }, null, 2))
+  process.exit(0)
+}
+
+console.log('\n=== 行为分歧基准（full vs stub）===')
+console.log(`日志 ${file}`)
+console.log(`模型 ${MODEL} · case ${rows.length}（历史窗口 ${WINDOW} 轮）· max_tokens ${MAX_TOKENS}`)
+console.log(`\n【主指标】A(full)↔B(stub) 下一步动作一致：${same}/${counted.length}${counted.length ? `（${(same / counted.length * 100).toFixed(0)}%）` : ''}`)
+if (withReal.length > 0) {
+  const ra = withReal.filter((r) => r.realA).length
+  const rb = withReal.filter((r) => r.realB).length
+  console.log(`【锚点】与真实后续一致：full ${ra}/${withReal.length} · stub ${rb}/${withReal.length}`)
+}
+console.log(`\n成本：未命中 ${totalMiss.toLocaleString()} + 命中 ${totalHit.toLocaleString()} ⇒ $${cost.toFixed(4)}（${rows.length} case × 2 臂）`)
+
+const diffs = counted.filter((r) => !r.same)
+if (diffs.length > 0) {
+  console.log(`\n=== 分歧明细（${diffs.length} 例）===`)
+  for (const d of diffs.slice(0, 6)) {
+    console.log(`\ncase ${d.case} turn=${d.turn} step=${d.step}（推理 ${d.reasoningChars} 字符）`)
+    console.log(`  full: ${String(d.actionA).slice(0, 200)}`)
+    console.log(`  stub: ${String(d.actionB).slice(0, 200)}`)
+    if (d.realAction) console.log(`  真实: ${String(d.realAction).slice(0, 200)}`)
+  }
+}
+const errs = rows.filter((r) => r.errA || r.errB)
+if (errs.length > 0) {
+  console.log(`\n=== 报错 ${errs.length} 例 ===`)
+  for (const e of errs.slice(0, 3)) console.log(`  case ${e.case}: A=${e.errA ?? '-'} B=${e.errB ?? '-'}`)
+}
+console.log(`\n读法：A↔B 一致率高 ⇒ 桩化推理不改变模型的下一步；锚点列显示两臂离真实有多远。`)

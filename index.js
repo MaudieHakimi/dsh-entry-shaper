@@ -34,7 +34,11 @@ const DEFAULT_OFF = join(homedir(), '.dsh-entry-shaper.OFF')
 
 const DEFAULTS = {
   enabled: true,
+  // 是否处理 reasoning（总闸）
   dropReasoning: true,
+  // 'stub'（默认，把推理文本换成短桩：字段在、内容省）| 'drop'（整块删除，主对话路径会被 400）
+  reasoningMode: 'stub',
+  stubTemplate: '[reasoning omitted: {chars} chars]',
   dropUsageOnReplace: true,
   logStats: true,
   // 可注入路径：默认写用户主目录；测试/嵌入时指向别处，避免污染
@@ -83,7 +87,24 @@ export function apply(ctx, config = {}) {
 
       const reasoning = content.filter((b) => b?.type === 'reasoning')
       if (reasoning.length === 0) return
+
+      const chars = reasoning.reduce((a, b) => a + (typeof b?.text === 'string' ? b.text.length : 0), 0)
+
+      // 两种塑形模式：
+      //   stub（默认）——把 reasoning 文本换成短桩：**字段仍在**，内容省掉。
+      //     依据（bench/passback-stub.mjs 实测）：thinking 模式下"延续工具回路"
+      //     （报文以 role:'tool' 结果结尾）时，缺 reasoning_content 会被拒：
+      //       "The `reasoning_content` in the thinking mode must be passed back to the API."
+      //     而把文本换成 `[reasoning omitted: N chars]` 后返回 200 ⇒ API 要的是字段在，不是内容全。
+      //   drop ——整块删除（更省，但只适用于"下一步不会延续工具回路"的场景；
+      //     实测在主对话路径上会被 400 拒绝，非必要不要用）。
       let kept = content.filter((b) => b?.type !== 'reasoning')
+      if (cfg.reasoningMode === 'stub') {
+        const stub = cfg.stubTemplate.replace('{chars}', String(chars))
+        const at = content.findIndex((b) => b?.type === 'reasoning')
+        kept = content.map((b, i) => (b?.type === 'reasoning' ? { ...b, text: i === at ? stub : '' } : b))
+        kept = kept.filter((b, i) => b?.type !== 'reasoning' || i === at)
+      }
 
       // 官方约束：assistant 消息必须有 content 或 tool_calls。全被摘空时补一个空 text 块。
       let emptyFixed = false
@@ -91,8 +112,6 @@ export function apply(ctx, config = {}) {
         kept = [{ type: 'text', text: '' }]
         emptyFixed = true
       }
-
-      const chars = reasoning.reduce((a, b) => a + (typeof b?.text === 'string' ? b.text.length : 0), 0)
 
       // provenance 必须**原样沿用**原事件：token-meter 的校验器（packages/llm/token-meter/
       // src/index.ts:279-304）逐条要求 assistant/message 的每个 sourceEventSeq 都是

@@ -77,7 +77,7 @@ test('订阅：注册 session/event 且带 global 标记', () => {
   assert.deepEqual(handlers[0].opts, { global: true })
 })
 
-test('定型：摘掉 reasoning，保留 text/tool-call，provenance 原样沿用', async () => {
+test('桩化（默认）：reasoning 块保留但文本换成短桩，text/tool-call 原样', async () => {
   const { handlers, appends, session } = setup()
   emit(handlers, session, makeEvent())
   await settle()
@@ -89,8 +89,50 @@ test('定型：摘掉 reasoning，保留 text/tool-call，provenance 原样沿�
   assert.equal(opts.surfaceOp.start, 570)
   assert.equal(opts.surfaceOp.end, 570)
   assert.deepEqual(opts.sourceEventSeqs, [17, 18, 19, 20], 'provenance 必须原样沿用')
-  assert.deepEqual(data.message.content.map((b) => b.type), ['text', 'tool-call'])
-  assert.equal(data.message.content[1].arguments, '{"path":"a.txt"}', 'tool-call 原样保留')
+  assert.deepEqual(data.message.content.map((b) => b.type), ['reasoning', 'text', 'tool-call'])
+  const stub = data.message.content[0].text
+  assert.equal(stub, '[reasoning omitted: 17 chars]', '字段仍在，内容换桩（thinking 模式要求字段回传）')
+  assert.equal(data.message.content[2].arguments, '{"path":"a.txt"}', 'tool-call 原样保留')
+})
+
+test('多个 reasoning 块：只留一个桩，其余删除', async () => {
+  const { handlers, appends, session } = setup()
+  emit(handlers, session, makeEvent({
+    content: undefined,
+    data: { message: { content: [
+      { type: 'reasoning', text: 'A'.repeat(3000) },
+      { type: 'reasoning', text: 'B'.repeat(500) },
+      { type: 'text', text: 'answer' },
+    ] } },
+  }))
+  await settle()
+  const content = appends[0][1].message.content
+  assert.deepEqual(content.map((b) => b.type), ['reasoning', 'text'])
+  assert.equal(content[0].text, '[reasoning omitted: 3500 chars]', '桩里含被省略的总字符数')
+})
+
+test('drop 模式（非默认）：整块删除 reasoning', async () => {
+  const { handlers, appends, session } = setup({ reasoningMode: 'drop' })
+  emit(handlers, session, makeEvent())
+  await settle()
+  assert.deepEqual(appends[0][1].message.content.map((b) => b.type), ['text', 'tool-call'])
+})
+
+test('drop 模式 + 纯 reasoning 消息：补空 text 块', async () => {
+  const { handlers, appends, session } = setup({ reasoningMode: 'drop' })
+  emit(handlers, session, makeEvent({
+    content: undefined,
+    data: { message: { content: [{ type: 'reasoning', text: 'only thinking' }] } },
+  }))
+  await settle()
+  assert.deepEqual(appends[0][1].message.content, [{ type: 'text', text: '' }])
+})
+
+test('可自定义桩模板', async () => {
+  const { handlers, appends, session } = setup({ stubTemplate: '<omitted {chars}>' })
+  emit(handlers, session, makeEvent())
+  await settle()
+  assert.equal(appends[0][1].message.content[0].text, '<omitted 17>')
 })
 
 test('不复制 usage（否则 token-meter 会把同一步计两次）', async () => {
@@ -123,11 +165,12 @@ test('无 reasoning 的消息被跳过', async () => {
   assert.equal(appends.length, 0)
 })
 
-test('纯 reasoning 消息：补空 text 块（官方要求 content 或 tool_calls 至少一个）', async () => {
+test('桩化模式下纯 reasoning 消息：保留桩块（不触发空内容兜底）', async () => {
   const { handlers, appends, session } = setup()
   emit(handlers, session, makeEvent({ content: undefined, data: { message: { content: [{ type: 'reasoning', text: 'only thinking' }] } } }))
   await settle()
-  assert.deepEqual(appends[0][1].message.content, [{ type: 'text', text: '' }])
+  assert.deepEqual(appends[0][1].message.content.map((b) => b.type), ['reasoning'])
+  assert.equal(appends[0][1].message.content[0].text, '[reasoning omitted: 13 chars]')
 })
 
 test('非 assistant/message 事件被跳过', async () => {

@@ -1,7 +1,12 @@
 # dsh-entry-shaper
 
 DSH 插件：**入口塑造（payload shaping）**——在元素被**首次发送之前**定型，使 payload 前缀永远单调，
-从而**零断点税**地缩小上下文。当前实现一件事：`assistant/message` 一追加，就摘掉它的 `reasoning` 块。
+从而**零断点税**地缩小上下文。当前实现一件事：把 assistant 消息里的 `reasoning` **桩化**
+（字段保留、内容换成 `[reasoning omitted: N chars]`，省掉 ~99% 的推理体积）。
+
+> ⚠️ **当前默认关闭**（`cordis.patch.yml` 里 `enabled: false`）。原因：行为分歧基准显示
+> 桩化推理会改变模型的下一步动作（8 个真实 case 中精确匹配一致率 0/8，含真实分歧），
+> 质量代价未经确认前不要打开。见下方「基准」。
 
 - 📐 **工作管道**（当前真实路径，含源码出处）：[docs/PIPELINE.md](docs/PIPELINE.md)
 - 🧩 **处理层规范**（op 组合、槽位协议、LLM op 口径、里程碑）：[docs/PROCESSING.md](docs/PROCESSING.md)
@@ -92,10 +97,30 @@ node test/run-all.mjs      # 本机（受限沙箱下 `node --test` 会挂）
 node --test test/          # CI
 ```
 
-## 未验证（写在最显眼处）
+## 基准（简洁、便宜、准确）
 
-- **质量影响未测**：模型下一次调用看不到自己刚生成的推理。API 层已实测**接受**
-  （缺 `reasoning_content` 的工具调用轮返回 200 OK），但"复杂任务表现是否退化"需要 A/B；
+```powershell
+# 行为分歧：同一前缀发两次（full 带完整推理 / stub 桩化），比"下一步动作"
+node bench/divergence.mjs "<session.jsonl.zstd>" --cases=8 --window=2
+# 规则边界：到底哪些 assistant 消息必须回传 reasoning_content
+node bench/passback-rule.mjs
+node bench/passback-stub.mjs
+```
+
+| 问题 | 答案（实测） | 出处 |
+|---|---|---|
+| 缺 `reasoning_content` 会被拒吗？ | **会**，但只在"延续工具回路"时（报文以 `role:'tool'` 结果结尾）⇒ 400 "must be passed back to the API"；末尾有用户消息时不会 | `bench/passback-stub.mjs` 变体 H/K vs A/B |
+| 那能不能换成短桩？ | **能**：把文本换成 `[reasoning omitted: N chars]` ⇒ 200 ✓ ⇒ **API 要的是字段在，不是内容全** | 变体 I vs H |
+| 桩化会改变模型的下一步吗？ | **会**：8 个真实 case 精确匹配一致率 **0/8**（含真实分歧：一臂继续排查、另一臂直接收工作答）。注意精确匹配**高估**分歧（同一意图的不同写法会被算作不同） | `bench/divergence.mjs` |
+| 成本 | 8 case × 2 臂 = **$0.005**（半分钱，前缀缓存大部分命中） | 同上 |
+
+⇒ 这就是"简洁、便宜、准确"的基准：**真实历史 + 同一前缀 + 确定性打分 + 真实后续作锚点**。
+
+## 未验证 / 已知代价
+
+- **质量影响已测出方向、未测出量级**：桩化推理确实会改变下一步动作（精确匹配 0/8），
+  但"是同一意图的不同写法"还是"真的做错了事"需要更粗的指标（同名工具率、意图键）
+  或带评分的任务集来判定；
 - tool 结果（21.4%）与 tool 参数（40.2%）**尚未塑形**——按 `docs/PROCESSING.md` §6 的风险序推进。
 
 ## 许可

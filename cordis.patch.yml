@@ -5,11 +5,12 @@
     - id: dsh-entry-shaper
       name: dsh-entry-shaper
       config:
-        # 打开（依据：DSH 本来就是"两份存"——表面折叠 replace 供模型使用，
-        # 而人类转录/界面只读 append-origin 事件：core/session/src/surface.ts:40-68、
-        # host/apiproxy/src/api-proxy.ts:218-227 "Replacement copies never entered the
-        # conversation a reader sees … they consume no quota"）。
-        enabled: true
+        # ⛔ 紧急关闭（2026-09-23）：行为分歧基准发现，在 thinking 模式下用**真实多轮历史**
+        # 发请求时，缺 reasoning_content 会被 API 拒绝：
+        #   "The `reasoning_content` in the thinking mode must be passed back to the API."
+        # 单轮探针（1 轮工具往返）曾返回 200，属于特例，不能代表真实会话。
+        # 规则边界正在用 bench/passback-rule.mjs 定位；在定论之前不要打开。
+        enabled: false
         # 当前唯一实现的塑形动作：摘掉 assistant/message 里的 reasoning 块
         dropReasoning: true
         # 替换事件不带 usage（meter 按事件折算 usage，复制会翻倍）。
