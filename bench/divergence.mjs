@@ -38,6 +38,7 @@ const WINDOW = numArg('window', 2)
 const PER_TURN = argv.includes('--per-turn')
 const MODEL = strArg('model', 'deepseek-flash')
 const MAX_TOKENS = numArg('max-tokens', 384)
+const TAIL = numArg('tail', 400)
 const JSON_OUT = argv.includes('--json')
 const PRICE_HIT = 0.02 / 1e6
 const PRICE_MISS = 1 / 1e6
@@ -127,8 +128,8 @@ const TOOL_TEXT = (rec) => {
   return out.join('\n').slice(0, 20000)
 }
 
-/** 构造某轮的请求 messages；mode: 'full'（DSH 现状）| 'stub'（本插件塑形后）。 */
-function buildMessages(windowRounds, { mode }) {
+/** 构造某轮的请求 messages；mode: 'full' | 'stub' | 'stub-tail'。 */
+function buildMessages(windowRounds, { mode, tailChars = 400 }) {
   const messages = [{
     role: 'system',
     content: 'You are a coding agent working in a repository via tools. '
@@ -138,8 +139,15 @@ function buildMessages(windowRounds, { mode }) {
   if (userText) messages.push({ role: 'user', content: userText })
   for (const r of windowRounds) {
     const assistant = { role: 'assistant', content: r.text ?? '' }
-    if (mode === 'full' && r.reasoning) assistant.reasoning_content = r.reasoning
-    if (mode === 'stub' && r.reasoning) assistant.reasoning_content = `[reasoning omitted: ${r.reasoning.length} chars]`
+    if (mode === 'full' && r.reasoning) {
+      assistant.reasoning_content = r.reasoning
+    } else if (mode === 'stub' && r.reasoning) {
+      assistant.reasoning_content = `[reasoning omitted: ${r.reasoning.length} chars]`
+    } else if (mode === 'stub-tail' && r.reasoning) {
+      // 桩 + 保留思考的**尾部**（决定通常在后半段；头部多为探索）
+      const tail = r.reasoning.length > tailChars ? r.reasoning.slice(-tailChars) : r.reasoning
+      assistant.reasoning_content = `[reasoning omitted: ${r.reasoning.length - tail.length} chars]\n${tail}`
+    }
     if (r.calls.length > 0) {
       assistant.tool_calls = r.calls.map((c, i) => ({
         id: c.id ?? `call_${r.step}_${i}`,
@@ -193,6 +201,34 @@ function canonicalJson(raw) {
 }
 const normalizeText = (t) => String(t).replace(/\s+/g, ' ').trim().slice(0, 300).toLowerCase()
 
+/** 动作的四档比较：kind（工具/文本）→ tool（同名工具）→ intent（意图键）→ exact（完全一致）。 */
+function tierOf(action) {
+  const a = String(action)
+  if (!a.startsWith('text:') && !a.startsWith('ERROR')) {
+    const names = [...a.matchAll(/([A-Za-z_][\w.]*)\(/g)].map((m) => m[1])
+    const paths = [...a.matchAll(/[A-Za-z]:\\\\[^"\\,)]+/g)].map((m) => m[0].toLowerCase())
+    const inner = [...a.matchAll(/tools\.(\w+)\(/g)].map((m) => m[1]).sort()
+    return {
+      kind: 'tool',
+      tool: names.sort().join('+'),
+      intent: `${names.sort().join('+')}|${inner.join('+')}|${paths.length > 0 ? paths.length : 'nopath'}`,
+      exact: a,
+    }
+  }
+  if (a.startsWith('ERROR')) return { kind: 'error', tool: 'error', intent: a, exact: a }
+  return { kind: 'text', tool: 'text', intent: 'text', exact: a }
+}
+const compareTiers = (x, y) => {
+  const A = tierOf(x)
+  const B = tierOf(y)
+  return {
+    kind: A.kind === B.kind,
+    tool: A.kind === B.kind && A.tool === B.tool,
+    intent: A.kind === B.kind && A.intent === B.intent,
+    exact: A.exact === B.exact,
+  }
+}
+
 /** 把一次响应归纳成可比较的"动作"：工具名 + 规范化参数；没有工具调用则退回文本。 */
 function canonicalAction(message) {
   const calls = message?.tool_calls ?? []
@@ -205,7 +241,10 @@ function canonicalAction(message) {
   const raw = Array.isArray(message?.content)
     ? message.content.map((b) => b?.text ?? '').join(' ')
     : message?.content ?? ''
-  return `text:${normalizeText(raw)}`
+  // 注意：模型可能"只在推理通道里作答"（content 为空、reasoning 有内容）——
+  // 这种回合若只看 content 会误判成"空文本"，所以把 reasoning 一并算进文本档。
+  const reasoning = typeof message?.reasoning_content === 'string' ? message.reasoning_content : ''
+  return `text:${normalizeText(`${raw} ${reasoning}`.trim())}`
 }
 
 async function call(messages, tools) {
@@ -248,61 +287,84 @@ for (const [i, target] of picked.entries()) {
 
   const a = await call(buildMessages(windowRounds, { mode: 'full' }), tools)
   const b = await call(buildMessages(windowRounds, { mode: 'stub' }), tools)
+  const c = await call(buildMessages(windowRounds, { mode: 'stub-tail', tailChars: TAIL }), tools)
   const actionA = a.ok ? canonicalAction(a.message) : `ERROR:${a.status}`
   const actionB = b.ok ? canonicalAction(b.message) : `ERROR:${b.status}`
-  for (const r of [a, b]) {
+  const actionC = c.ok ? canonicalAction(c.message) : `ERROR:${c.status}`
+  for (const r of [a, b, c]) {
     if (r.ok && r.usage) {
       totalMiss += r.usage.prompt_cache_miss_tokens ?? 0
       totalHit += r.usage.prompt_cache_hit_tokens ?? 0
     }
   }
+  const tStub = compareTiers(actionA, actionB)
+  const tTail = compareTiers(actionA, actionC)
   rows.push({
     case: i + 1, turn: target.turn, step: target.step,
     reasoningChars: target.reasoning.length,
-    same: actionA === actionB,
+    tStub, tTail,
+    same: tStub.exact,
     realA: realAction === null ? null : actionA === realAction,
     realB: realAction === null ? null : actionB === realAction,
-    actionA, actionB, realAction,
-    errA: a.ok ? null : a.detail, errB: b.ok ? null : b.detail,
+    actionA, actionB, actionC, realAction,
+    errA: a.ok ? null : a.detail, errB: b.ok ? null : b.detail, errC: c.ok ? null : c.detail,
   })
   if (!JSON_OUT) process.stdout.write(`case ${i + 1}/${picked.length} 完成\r`)
 }
 if (!JSON_OUT) process.stdout.write(' '.repeat(30) + '\r')
 
 const counted = rows.filter((r) => !String(r.actionA).startsWith('ERROR') && !String(r.actionB).startsWith('ERROR'))
-const same = counted.filter((r) => r.same).length
+const rate = (key, tier) => {
+  const ok = counted.filter((r) => r[key][tier]).length
+  return `${ok}/${counted.length}${counted.length ? `（${(ok / counted.length * 100).toFixed(0)}%）` : ''}`
+}
 const withReal = counted.filter((r) => r.realA !== null)
 const cost = totalHit * PRICE_HIT + totalMiss * PRICE_MISS
+const same = counted.filter((r) => r.tStub.exact).length
 
 if (JSON_OUT) {
-  console.log(JSON.stringify({ model: MODEL, cases: rows.length, counted: counted.length, same, rows, cost, totalHit, totalMiss }, null, 2))
+  console.log(JSON.stringify({ model: MODEL, cases: rows.length, counted: counted.length, rows, cost, totalHit, totalMiss }, null, 2))
   process.exit(0)
 }
 
-console.log('\n=== 行为分歧基准（full vs stub）===')
+console.log('\n=== 行为分歧基准（full / stub / stub-tail 三臂）===')
 console.log(`日志 ${file}`)
-console.log(`模型 ${MODEL} · case ${rows.length}（历史窗口 ${WINDOW} 轮）· max_tokens ${MAX_TOKENS}`)
-console.log(`\n【主指标】A(full)↔B(stub) 下一步动作一致：${same}/${counted.length}${counted.length ? `（${(same / counted.length * 100).toFixed(0)}%）` : ''}`)
+console.log(`模型 ${MODEL} · case ${rows.length}（历史窗口 ${WINDOW} 轮）· max_tokens ${MAX_TOKENS} · 尾部保留 ${TAIL} 字符`)
+console.log('\n【四档一致率】full 为基准，比较塑形后是否给出"同一个动作"')
+console.log(`  档位        纯桩(stub)      桩+尾(stub-tail)`)
+console.log(`  动作类型    ${rate('tStub', 'kind').padEnd(16)}${rate('tTail', 'kind')}`)
+console.log(`  同名工具    ${rate('tStub', 'tool').padEnd(16)}${rate('tTail', 'tool')}`)
+console.log(`  意图键      ${rate('tStub', 'intent').padEnd(16)}${rate('tTail', 'intent')}`)
+console.log(`  完全一致    ${rate('tStub', 'exact').padEnd(16)}${rate('tTail', 'exact')}`)
 if (withReal.length > 0) {
   const ra = withReal.filter((r) => r.realA).length
   const rb = withReal.filter((r) => r.realB).length
-  console.log(`【锚点】与真实后续一致：full ${ra}/${withReal.length} · stub ${rb}/${withReal.length}`)
+  console.log(`\n【锚点】与真实后续完全一致：full ${ra}/${withReal.length} · stub ${rb}/${withReal.length}（窗口小、工具 schema 简化 ⇒ 参考价值有限）`)
 }
-console.log(`\n成本：未命中 ${totalMiss.toLocaleString()} + 命中 ${totalHit.toLocaleString()} ⇒ $${cost.toFixed(4)}（${rows.length} case × 2 臂）`)
+console.log(`\n成本：未命中 ${totalMiss.toLocaleString()} + 命中 ${totalHit.toLocaleString()} ⇒ $${cost.toFixed(4)}（${rows.length} case × 3 臂）`)
 
-const diffs = counted.filter((r) => !r.same)
-if (diffs.length > 0) {
-  console.log(`\n=== 分歧明细（${diffs.length} 例）===`)
-  for (const d of diffs.slice(0, 6)) {
+const kindDiff = counted.filter((r) => !r.tStub.kind)
+if (kindDiff.length > 0) {
+  console.log(`\n=== 最严重的一档：动作类型都变了（${kindDiff.length} 例）===`)
+  for (const d of kindDiff.slice(0, 5)) {
     console.log(`\ncase ${d.case} turn=${d.turn} step=${d.step}（推理 ${d.reasoningChars} 字符）`)
-    console.log(`  full: ${String(d.actionA).slice(0, 200)}`)
-    console.log(`  stub: ${String(d.actionB).slice(0, 200)}`)
-    if (d.realAction) console.log(`  真实: ${String(d.realAction).slice(0, 200)}`)
+    console.log(`  full     : ${String(d.actionA).slice(0, 160)}`)
+    console.log(`  stub     : ${String(d.actionB).slice(0, 160)}`)
+    console.log(`  stub-tail: ${String(d.actionC).slice(0, 160)}`)
   }
 }
-const errs = rows.filter((r) => r.errA || r.errB)
+const toolDiff = counted.filter((r) => r.tStub.kind && !r.tStub.tool)
+if (toolDiff.length > 0) {
+  console.log(`\n=== 同名工具但换了目标（${toolDiff.length} 例，抽样 3）===`)
+  for (const d of toolDiff.slice(0, 3)) {
+    console.log(`\ncase ${d.case}: full=${String(d.actionA).slice(0, 120)}`)
+    console.log(`            stub=${String(d.actionB).slice(0, 120)}`)
+  }
+}
+const errs = rows.filter((r) => r.errA || r.errB || r.errC)
 if (errs.length > 0) {
   console.log(`\n=== 报错 ${errs.length} 例 ===`)
-  for (const e of errs.slice(0, 3)) console.log(`  case ${e.case}: A=${e.errA ?? '-'} B=${e.errB ?? '-'}`)
+  for (const e of errs.slice(0, 3)) console.log(`  case ${e.case}: A=${e.errA ?? '-'} B=${e.errB ?? '-'} C=${e.errC ?? '-'}`)
 }
-console.log(`\n读法：A↔B 一致率高 ⇒ 桩化推理不改变模型的下一步；锚点列显示两臂离真实有多远。`)
+console.log('\n读法：四档从上到下越来越严。"动作类型"一致 = 没有做出性质不同的决定；'
+  + '"完全一致"为 0 不代表做错事（同一意图的不同写法也会判 0）。')
