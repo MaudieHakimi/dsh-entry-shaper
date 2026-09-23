@@ -499,9 +499,19 @@ export function createProxyAdapter({ llm, upstream, policy, getPolicy, ctx, shou
       }
     },
     stream: (options) => proxyStream(options),
-    async listModels() {
+    /**
+     * 枚举本路由的模型。**必须把 provider 改盖成本路由 id**：宿主
+     * `LlmRuntime.listModels()`（`llm/src/index.ts:608-624`）逐条校验
+     * `model.provider === provider`、`id` 非空且不重复、`name` 非空。直接转手上游列表
+     * （其中 provider 是**上游 id**）会抛
+     *   `INVALID_CATALOG: adapter returned invalid or duplicate model metadata`
+     * 后果是**整组在选择器里消失** —— 实测现象：模型选择器里只剩官方那组，
+     * 用户"只看到模型名"，看不到代理。
+     */
+    async listModels(provider) {
       try {
-        return (await llm.listModels?.(upstream)) ?? []
+        const models = (await llm.listModels?.(upstream)) ?? []
+        return models.map((model) => ({ ...model, provider }))
       } catch {
         return []
       }

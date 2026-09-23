@@ -2,6 +2,35 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与语义化版本。
 
+## [0.9.3] — 2026-09-23
+
+**代理在模型选择器里"整组消失"的根因修复：`listModels()` 也必须改盖 provider。**
+
+### Fixed
+
+- **现象**：模型选择器里看不到任何代理项，只有官方那组的模型名。
+  宿主目录接口给出的原因是
+  `INVALID_CATALOG: adapter returned invalid or duplicate model metadata for provider "deepseek-shaped"`
+  （实测：`POST /api/llm.models` 的 `failures` 里就是这条，整组被判失败）。
+  根因：`LlmRuntime.listModels()`（`llm/src/index.ts:608-624`）会逐条校验
+  `model.provider === provider`、`id` 非空不重复、`name` 非空；而代理的 `listModels()`
+  **原样转手上游列表**（其中每条 `provider` 是**上游 id**）⇒ 抛 `INVALID_CATALOG`。
+  现在逐条改盖 `provider` 为本路由 id（其余字段照搬上游）。
+- 这与 0.9.2 修的 `resolveModel()` 是**同一类**错误。教训写死：**凡"转手上游元数据"的
+  返回值，provider 一律改盖成本路由 id**（`listModels` / `resolveModel` / `prepareCall` 三处）。
+
+### 测试 60/60
+
+新增 1 例：复刻宿主 `LlmRuntime.listModels()` 的逐条校验（provider 已改盖、id 非空不重复、
+name 非空、其余字段照搬上游、上游失败时返回空列表）；并把假上游改成**带 provider 字段**，
+否则测不出改盖行为（这正是旧测试漏掉它的原因）。
+
+### 记一条调试通道（本次靠它定位，值得复用）
+
+`POST /api/llm.models`（或 `session.models`）能直接读到**模型选择器看到的同一份目录**，
+含 `failures`。请求体 `{type:'client-request', rpcId, method, payload}`；
+围栏只要求 Host 是回环、无 `Origin` 时放行（`packages/client/connection/src/api-request-trust.ts:96-122`）。
+
 ## [0.9.2] — 2026-09-23
 
 **代理适配器补齐运行时契约 + 代理改为惰性可热开。**

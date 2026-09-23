@@ -615,7 +615,9 @@ function fakeLlm() {
       return { provider, id: model, name: 'Upstream Name', contextWindow: 1000000 }
     },
     async listModels() {
-      return [{ id: 'deepseek-flash', name: 'v4.1-flash' }]
+      // 真实上游返回的每条都带自己的 provider —— 这正是"原样转手"会踩雷的原因，
+      // 所以假上游必须也带上，否则测不出改盖行为。
+      return [{ provider: 'deepseek-official', id: 'deepseek-flash', name: 'v4.1-flash' }]
     },
     providerRetryPolicy(provider) {
       return { provider, maxAttempts: 3 }
@@ -664,6 +666,33 @@ test('代理适配器：满足运行时对适配器的**全部**成员要求（�
   assert.equal(bare.providerRetryPolicy('alias'), undefined, '拿不到上游策略 ⇒ undefined（等价基类默认）')
 })
 
+test('代理适配器：listModels 满足宿主目录校验（provider 必须改盖，否则整组消失）', async () => {
+  const llm = fakeLlm()
+  const adapter = createProxyAdapter({ llm, upstream: 'deepseek-official', policy: {}, ctx: {} })
+  const listed = await adapter.listModels('deepseek-shaped')
+
+  // 复刻 LlmRuntime.listModels()（llm/src/index.ts:608-624）的逐条校验。
+  // 旧实现原样转手上游列表 ⇒ 每条 provider 是 'deepseek-official' ≠ 本路由 id
+  // ⇒ 抛 INVALID_CATALOG ⇒ 模型选择器里整组消失（实测现场就是这么发现的）。
+  assert.ok(listed.length > 0, '必须能枚举出模型')
+  const seen = new Set()
+  for (const model of listed) {
+    assert.equal(model.provider, 'deepseek-shaped', 'model.provider 必须是本路由 id')
+    assert.ok(typeof model.id === 'string' && model.id.length > 0, 'id 非空')
+    assert.ok(typeof model.name === 'string' && model.name.length > 0, 'name 非空')
+    assert.ok(!seen.has(model.id), 'id 不得重复')
+    seen.add(model.id)
+  }
+  assert.equal(listed[0].name, 'v4.1-flash', '其余字段照搬上游')
+
+  // 上游枚举失败时返回空列表（而不是抛）
+  const broken = createProxyAdapter({
+    llm: { stream: () => (async function* () {})() },
+    upstream: 'up', policy: {}, ctx: {},
+  })
+  assert.deepEqual(await broken.listModels('alias'), [])
+})
+
 test('代理适配器：转发时换成上游 provider，并把 messages 塑形', async () => {
   const llm = fakeLlm()
   const policy = { reasoning: { ops: [{ op: 'stub' }] }, toolResult: { ops: [{ op: 'keep' }] }, toolArgs: { ops: [{ op: 'keep' }] }, assistantText: { ops: [{ op: 'keep' }] } }
@@ -688,10 +717,11 @@ test('代理适配器：shouldShape=false（哨兵/总闸关闭）时原样转�
   assert.equal(forwarded.provider, 'deepseek-official', '仍然要正常转发（不拒绝请求）')
 })
 
-test('代理适配器：listModels 照搬上游', async () => {
+test('代理适配器：模型列表来自上游，但 provider 改盖成本路由 id', async () => {
   const llm = fakeLlm()
   const adapter = createProxyAdapter({ llm, upstream: 'deepseek-official', policy: {}, ctx: {} })
-  assert.deepEqual(await adapter.listModels('deepseek-shaped'), [{ id: 'deepseek-flash', name: 'v4.1-flash' }])
+  assert.deepEqual(await adapter.listModels('deepseek-shaped'),
+    [{ provider: 'deepseek-shaped', id: 'deepseek-flash', name: 'v4.1-flash' }])
 })
 
 test('插件启动：proxy.enabled 时注册代理 provider；拿不到 llm 服务则 fail-open', () => {
