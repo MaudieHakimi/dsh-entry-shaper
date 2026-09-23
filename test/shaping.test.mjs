@@ -8,7 +8,7 @@ import { mkdirSync, rmSync, writeFileSync, existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { apply, applyOps, createOpCache, createProxyAdapter, extractReasoning, shapeMessages } from '../index.js'
+import { apply, applyOps, createOpCache, createProxyAdapter, extractReasoning, mergeCfg, shapeMessages } from '../index.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const TMP = join(HERE, '.tmp')
@@ -39,7 +39,12 @@ function setup(config = {}) {
   // 说明：assistant/message 的"表面替换"路径在真实 harness 上被证明**不可用**
   // （session 端与 token-meter 端的 provenance 要求互相矛盾），因此默认关闭。
   // 这里默认打开它，是为了继续覆盖那段代码；真实生效的路径是 llm/stream 中间件。
-  apply(ctx, { logPath, offSentinel: sentinel, surfaceAssistant: true, ...config })
+  // configPath 必须隔离：apply() 默认会去读真实主目录的 ~/.dsh-entry-shaper.config.json，
+  // 那会让本机实际配置污染整套测试（热挂载实验期间会整体变红）。指向一个不存在的文件
+  // ⇒ refreshCfg 沿用 patch 传入的 config，测试才只测被显式传进来的东西。
+  const configPath = join(TMP, `cfg-${caseNo}.json`)
+  rmSync(configPath, { force: true })
+  apply(ctx, { logPath, offSentinel: sentinel, configPath, surfaceAssistant: true, ...config })
   return { handlers, appends, session, logPath, sentinel, ctx }
 }
 
@@ -52,7 +57,10 @@ function setupStream(config = {}) {
   rmSync(sentinel, { force: true })
   const listeners = []
   const ctx = { on: (name, handler) => { listeners.push({ name, handler }); return () => {} } }
-  apply(ctx, { logPath, offSentinel: sentinel, ...config })
+  // 同上：隔离 configPath，避免读到主目录里的真实热配置
+  const configPath = join(TMP, `stream-cfg-${caseNo}.json`)
+  rmSync(configPath, { force: true })
+  apply(ctx, { logPath, offSentinel: sentinel, configPath, ...config })
   return {
     streamListener: listeners.find((l) => l.name === 'llm/stream')?.handler,
     listeners,
@@ -659,13 +667,13 @@ test('插件启动：proxy.enabled 时注册代理 provider；拿不到 llm 服�
     on: () => () => {},
     get: (name) => (name === 'llm' ? { registerAdapter: (p, a) => registered.push({ p, a }) } : undefined),
   }
-  apply(ctx, { logPath: join(TMP, `proxy-${caseNo += 1}.log`), offSentinel: join(TMP, 'no.OFF'), proxy: { enabled: true, provider: 'shaped-x', upstream: 'deepseek-official' } })
+  apply(ctx, { logPath: join(TMP, `proxy-${caseNo += 1}.log`), offSentinel: join(TMP, 'no.OFF'), configPath: join(TMP, 'proxy-cfg-none.json'), proxy: { enabled: true, provider: 'shaped-x', upstream: 'deepseek-official' } })
   assert.equal(registered.length, 1, '应注册一个代理 provider')
   assert.deepEqual(registered[0].p, ['shaped-x'])
   assert.equal(typeof registered[0].a.stream, 'function')
 
   const noLlmCtx = { on: () => () => {}, get: () => undefined }
-  assert.doesNotThrow(() => apply(noLlmCtx, { logPath: join(TMP, 'proxy-nollm.log'), offSentinel: join(TMP, 'no.OFF'), proxy: { enabled: true } }))
+  assert.doesNotThrow(() => apply(noLlmCtx, { logPath: join(TMP, 'proxy-nollm.log'), offSentinel: join(TMP, 'no.OFF'), configPath: join(TMP, 'proxy-nollm-cfg-none.json'), proxy: { enabled: true } }))
 })
 
 test('热配置：改配置文件无需重启即生效（按 mtime 热读）', async () => {
@@ -704,13 +712,55 @@ test('非 assistant/message 事件被跳过', async () => {
   assert.equal(appends.length, 0)
 })
 
-test('开关：enabled=false / dropReasoning=false 时不动作', async () => {
-  for (const config of [{ enabled: false }, { dropReasoning: false }]) {
-    const { handlers, appends, session } = setup(config)
-    emit(handlers, session, makeEvent())
-    await settle()
-    assert.equal(appends.length, 0, JSON.stringify(config))
-  }
+/** 一个"必然会被塑形"的 tool/result 事件（300 字符 + truncate:60 一定改变文本）。 */
+const TOOL_RESULT = {
+  type: 'tool/result',
+  seq: 900,
+  surfaceOp: 'append',
+  data: { turn: 1, step: 1, message: { content: [{ type: 'tool-result', toolCallId: 'c1', content: [{ type: 'text', text: 'X'.repeat(300) }] }] } },
+}
+const TRUNCATE = { policy: { toolResult: { ops: [{ op: 'truncate', maxChars: 60 }] } } }
+
+test('开关 enabled=false：两条通道都不动作（事件 + 流过滤）', async () => {
+  const { handlers, appends, session } = setup({ enabled: false, ...TRUNCATE })
+  emit(handlers, session, TOOL_RESULT)
+  await settle()
+  assert.equal(appends.length, 0, 'enabled=false ⇒ tool/result 不塑形')
+
+  const { streamListener } = setupStream({ enabled: false })
+  const out = await runStream(streamListener, [{ type: 'reasoning', text: 'FULL' }])
+  assert.equal(out[0].text, 'FULL', 'enabled=false ⇒ 流原样透传')
+})
+
+test('开关 shapeReasoning=false：只关推理，不牵连 toolResult（旧版把两者压在同一开关上 ⇒ 静默失效）', async () => {
+  const { handlers, appends, session } = setup({ shapeReasoning: false, ...TRUNCATE })
+  emit(handlers, session, TOOL_RESULT)
+  await settle()
+  assert.equal(appends.length, 1, 'toolResult 塑形必须仍然生效')
+  assert.ok(appends[0][1].message.content[0].content[0].text.includes('省略'), 'tool 结果确实被截了')
+
+  const { streamListener } = setupStream({ shapeReasoning: false })
+  const out = await runStream(streamListener, [{ type: 'reasoning', text: 'FULL' }])
+  assert.equal(out[0].text, 'FULL', '推理确实没被动')
+})
+
+test('旧名 dropReasoning=false 等价于 shapeReasoning=false（且同样只关推理）', async () => {
+  const { handlers, appends, session } = setup({ dropReasoning: false, ...TRUNCATE })
+  emit(handlers, session, TOOL_RESULT)
+  await settle()
+  assert.equal(appends.length, 1, '旧名不该把 toolResult 一起关掉')
+
+  const { streamListener } = setupStream({ dropReasoning: false })
+  const out = await runStream(streamListener, [{ type: 'reasoning', text: 'FULL' }])
+  assert.equal(out[0].text, 'FULL', '旧名仍能关掉推理塑形')
+})
+
+test('mergeCfg：旧名归一、新名优先、空值安全', () => {
+  assert.deepEqual(mergeCfg({ dropReasoning: false, a: 1 }), { shapeReasoning: false, a: 1 })
+  assert.deepEqual(mergeCfg({ dropReasoning: true, shapeReasoning: false }), { shapeReasoning: false },
+    '两个名字都给时以新名为准')
+  assert.deepEqual(mergeCfg({}), {})
+  assert.deepEqual(mergeCfg(undefined), {})
 })
 
 test('免重启熔断：哨兵文件存在时不动作', async () => {

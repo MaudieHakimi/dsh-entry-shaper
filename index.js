@@ -120,8 +120,10 @@ export function createOpCache(cfg, log) {
 
 const DEFAULTS = {
   enabled: true,
-  // 是否处理 reasoning（总闸）
-  dropReasoning: true,
+  // 是否**塑形推理**这一类（旧名 dropReasoning 仍兼容，见 mergeCfg）。
+  // 它不是全局总闸：工具结果 / 工具参数 / 助手文本只看 enabled。
+  // （旧版把整条事件链压在推理开关下 ⇒ 写 `dropReasoning:false` 会把 toolResult 塑形一起静默关掉。）
+  shapeReasoning: true,
   // ── 处理层：按内容类别各给一条 op 序列（文本 → 文本 的纯函数链）──
   //   可用 op：keep | drop | stub | extract | head | tail | truncate
   //   未列出的类别一律 keep（默认不动）。
@@ -496,8 +498,24 @@ export function createProxyAdapter({ llm, upstream, policy, getPolicy, ctx, shou
   }
 }
 
+/**
+ * 合并配置源（后者覆盖前者），并把旧名 `dropReasoning` 归一成 `shapeReasoning`。
+ * 为什么必须显式归一：DEFAULTS 里已经有 `shapeReasoning`，若直接 `{ ...DEFAULTS, ...hot }`，
+ * 用户写在热配置里的旧名 `dropReasoning: false` 会被 DEFAULTS 的默认值静默盖掉
+ * —— 与 `reasoningMode` 当初踩的坑是同一个（判据必须看用户真正写了什么，不能看合并结果）。
+ * @param source - patch / 热配置文件里的原始对象。
+ * @returns 归一后的配置片段（不含 dropReasoning）。
+ */
+export function mergeCfg(source) {
+  if (!source || typeof source !== 'object') return {}
+  const { dropReasoning, shapeReasoning, ...rest } = source
+  if (shapeReasoning !== undefined) return { ...rest, shapeReasoning }
+  if (dropReasoning !== undefined) return { ...rest, shapeReasoning: dropReasoning }
+  return rest
+}
+
 export function apply(ctx, config = {}) {
-  let cfg = { ...DEFAULTS, ...(config ?? {}) }
+  let cfg = { ...DEFAULTS, ...mergeCfg(config) }
   const CONFIG_PATH = cfg.configPath ?? DEFAULT_CONFIG
   let configStamp = -1
 
@@ -507,13 +525,15 @@ export function apply(ctx, config = {}) {
    * 这个 JSON 文件里，运行时按 mtime 检查、变了就重新合并 ⇒ 改配置**不需要重启** ✓，
    * 同时 patch 保持"纯 insert" ⇒ 可以被市场/`dsh plugin add` 热挂载 ✓。
    */
+  let hotUsedLegacySwitch = false
   const refreshCfg = () => {
     try {
       const st = statSync(CONFIG_PATH)
       if (st.mtimeMs === configStamp) return
       configStamp = st.mtimeMs
       const hot = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'))
-      cfg = { ...DEFAULTS, ...(config ?? {}), ...hot, configPath: CONFIG_PATH }
+      hotUsedLegacySwitch = hot.dropReasoning !== undefined && hot.shapeReasoning === undefined
+      cfg = { ...DEFAULTS, ...mergeCfg(config), ...mergeCfg(hot), configPath: CONFIG_PATH }
       try { log(`配置热更新 ${CONFIG_PATH}（mtime=${new Date(st.mtimeMs).toISOString()}）`) } catch { /* 日志失败忽略 */ }
     } catch { /* 文件不存在或坏 JSON ⇒ 沿用当前配置（fail-open） */ }
   }
@@ -531,10 +551,13 @@ export function apply(ctx, config = {}) {
   }
 
   log(
-    `applied pid=${process.pid} enabled=${cfg.enabled} dropReasoning=${cfg.dropReasoning}`
+    `applied pid=${process.pid} enabled=${cfg.enabled} shapeReasoning=${cfg.shapeReasoning}`
     + ` policy=${Object.entries(cfg.policy ?? {}).map(([k, v]) => `${k}:${(v?.ops ?? []).map((o) => o?.op).join('→') || 'keep'}`).join(',')}`
     + ` log=${cfg.logPath ?? DEFAULT_LOG} off=${existsSync(OFF)} config=${CONFIG_PATH}`,
   )
+  if (config?.dropReasoning !== undefined || hotUsedLegacySwitch) {
+    log('配置使用了旧名 dropReasoning ⇒ 已归一为 shapeReasoning（效果相同，建议改新名）')
+  }
 
   /** 交给 op 的上下文：可注入 fetch/spawn（便于测试），LLM 凭据与脱敏也走这里。 */
   const opCache = createOpCache(cfg, log)
@@ -571,6 +594,20 @@ export function apply(ctx, config = {}) {
       } else {
         const alias = cfg.proxy.provider ?? 'deepseek-shaped'
         const upstream = cfg.proxy.upstream ?? 'deepseek-official'
+        /**
+         * 代理是否需要塑形：**任一**类别存在非 keep 的 op 才算需要。
+         * 旧判据是 `cfg.dropReasoning` ⇒ 只要关掉推理塑形，代理连工具结果/助手文本的塑形
+         * 一起放弃（代理本就服务所有类别，不该被推理开关挟持）。
+         */
+        const anyShaping = () => {
+          const policy = resolvePolicy()
+          for (const [kind, entry] of Object.entries(policy)) {
+            if (kind === 'reasoning' && cfg.shapeReasoning === false) continue
+            const ops = entry?.ops ?? []
+            if (ops.some((op) => op && op.op !== undefined && op.op !== 'keep')) return true
+          }
+          return false
+        }
         const shouldShape = () => {
           refreshCfg()
           const off = existsSync(OFF)
@@ -578,7 +615,7 @@ export function apply(ctx, config = {}) {
             stats.proxyOffNoted = true
             log('proxy 侦测到哨兵文件 ⇒ 原样转发（不塑形）')
           }
-          return cfg.enabled && cfg.dropReasoning && !off
+          return cfg.enabled && !off && anyShaping()
         }
         const adapter = createProxyAdapter({
           llm,
@@ -615,7 +652,8 @@ export function apply(ctx, config = {}) {
 
   const shapeReasoningStream = (options, next) => {
     refreshCfg()
-    if (!cfg.enabled || !cfg.dropReasoning) return next(options)
+    // 这条通道**只**服务推理 ⇒ 判据就该是"要不要塑形推理"（与 enabled 一起）。
+    if (!cfg.enabled || cfg.shapeReasoning === false) return next(options)
     // 急刹（哨兵）对流过滤同样要生效 —— 之前只在表面事件那条路检查，是个缺口。
     if (existsSync(OFF)) return next(options)
     // 代理 provider 已启用时**必须**让流原样通过：否则内层转调（provider=upstream）会再次
@@ -682,7 +720,10 @@ export function apply(ctx, config = {}) {
   async function handleEvent(session, event) {
     {
       refreshCfg()
-      if (!cfg.enabled || !cfg.dropReasoning) return
+      // 这条通道服务 toolResult / toolArgs / assistantText 等**非推理**类别 ⇒ 只看 enabled。
+      // （旧版这里写的是 `!cfg.dropReasoning`，把"关掉推理塑形"误当成"整个插件停手"，
+      //   结果是 toolResult 塑形静默失效 —— 与"看着能调、其实是死的旋钮"是同一类 bug。）
+      if (!cfg.enabled) return
       stats.events += 1
 
       // 熔断：哨兵文件存在就什么都不做（每 64 个事件查一次，避免高频 stat）

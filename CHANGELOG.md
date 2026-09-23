@@ -2,6 +2,60 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与语义化版本。
 
+## [0.9.1] — 2026-09-23
+
+**开关语义修正：`dropReasoning` → `shapeReasoning`，并把它从"总闸"降回"只管推理"。**
+
+### Fixed
+
+- **静默失效**：事件处理链（含 `toolResult` / `toolArgs` / `assistantText` 塑形）此前被
+  `!cfg.dropReasoning` 一并掐住 —— 用户写 `dropReasoning: false`（本意"别碰推理"）会把
+  **工具结果塑形一起关掉**，而且日志里看不出任何异常。现在事件链只看 `enabled`，
+  推理通道（`llm/stream` 过滤 + `proxy`）才看 `shapeReasoning`。
+- **代理被推理开关挟持**：`shouldShape()` 旧判据是 `cfg.enabled && cfg.dropReasoning && !off`，
+  于是"关掉推理塑形"会让代理连工具结果/助手文本的塑形一起放弃。现在改为
+  **任一类别存在非 keep 的 op** 才需要塑形（新增 `anyShaping()`）。
+- **测试未隔离 `configPath`**：`apply()` 默认会读真实主目录的 `~/.dsh-entry-shaper.config.json`，
+  本机一旦存在该文件就会污染整套测试。现在 `setup()` / `setupStream()` / 代理用例都指向
+  临时目录里不存在的路径。
+
+### Added
+
+- `mergeCfg()`（导出，可单测）：把旧名 `dropReasoning` 归一成 `shapeReasoning`。
+  必须显式归一 —— `{ ...DEFAULTS, ...hot }` 会让热配置里的旧名被 DEFAULTS 静默盖掉
+  （与当初 `reasoningMode` 被静默忽略是同一个坑）。
+- 启动自证行改印 `shapeReasoning=`；若配置用的是旧名，会追加一行提示。
+- `docs/OFFICIAL-STACK.md`：官方栈三层（`tool-result-pruner` / `compaction-basic` /
+  `command-compact`）的位置、阈值、代价，本机一次 `/compact` 的实测账单
+  （539,772 token ⇒ 33,092 字符摘要，破点税仅 6,176 全价 token），以及本插件的空位定位。
+
+### 测试 57/57
+
+新增 4 例：`enabled=false` 两通道皆静默、`shapeReasoning=false` 只关推理不牵连 `toolResult`
+（旧版此处为 0 次替换，正是这条测试抓住的 bug）、旧名 `dropReasoning` 等价、`mergeCfg`
+归一与优先级。
+
+### 运行测试的沙箱注意
+
+`node test/shaping.test.mjs`（直接跑，进程内）可用；`node --test`（派生测试子进程 + 管道）
+在受限沙箱下会以 `spawn EPERM` 失败 —— 那是运行器要管道，不是测试本身的问题。
+
+## [0.6.0 – 0.9.0] — 2026-09-23（合并条目，未逐版细分）
+
+- **0.9.0 代理 provider**：`proxy.enabled` 注册一个新 provider（默认 `deepseek-shaped`），
+  适配器在 **wire 层**塑形后再转调上游 ⇒ **日志与界面保留原文、零断点税**；
+  另有急刹（哨兵）在代理与流过滤两条路上都生效。
+- **0.9.0 可热挂载**：`cordis.patch.yml` 改为**纯 insert**（不含配置行/表达式，
+  见 `dshmarket/lib/hot.js:295`）⇒ 市场可热挂载；所有可调项移到
+  `~/.dsh-entry-shaper.config.json`，**运行时按 mtime 热读 ⇒ 改配置不用重启**。
+- **0.8.0 免重启熔断 + 结果缓存**：存在 `~/.dsh-entry-shaper.OFF` 即停手；
+  非纯 op（`summarize` / `python`）的结果按内容哈希 + 配置指纹缓存，保证同一输入出网结果恒定
+  （否则前缀变化 ⇒ 断点税）。
+- **0.7.0 基准**：`bench/divergence.mjs`（4 档 × 3 臂）、`bench/replay.mjs`（固定轨迹、
+  可 `--dry`）、`bench/agentic/`（含 8 个深任务）；结论：`extract` 在各档都不劣于 `stub`
+  （动作类 15/17 vs 12/17），体积 −36.2% vs −38.0% ⇒ **默认 `extract`**。
+- **0.6.0 脱敏注入口**：不再硬编码脱敏规则，改为 `redact` 回调槽位。
+
 ## [0.5.0] — 2026-09-23
 
 **架构收口：异步 op 管线 + Python 接口 + OpenAI 兼容 LLM 塑形 + 四道栈护栏。**
