@@ -77,7 +77,7 @@ test('订阅：注册 session/event 且带 global 标记', () => {
   assert.deepEqual(handlers[0].opts, { global: true })
 })
 
-test('桩化（默认）：reasoning 块保留但文本换成短桩，text/tool-call 原样', async () => {
+test('决策抽取（默认）：reasoning 换成"抽取 + 省略计数"，text/tool-call 原样', async () => {
   const { handlers, appends, session } = setup()
   emit(handlers, session, makeEvent())
   await settle()
@@ -90,13 +90,12 @@ test('桩化（默认）：reasoning 块保留但文本换成短桩，text/tool-
   assert.equal(opts.surfaceOp.end, 570)
   assert.deepEqual(opts.sourceEventSeqs, [17, 18, 19, 20], 'provenance 必须原样沿用')
   assert.deepEqual(data.message.content.map((b) => b.type), ['reasoning', 'text', 'tool-call'])
-  const stub = data.message.content[0].text
-  assert.equal(stub, '[reasoning omitted: 17 chars]', '字段仍在，内容换桩（thinking 模式要求字段回传）')
+  assert.ok(data.message.content[0].text.startsWith('[reasoning extract:'), '默认走决策抽取')
   assert.equal(data.message.content[2].arguments, '{"path":"a.txt"}', 'tool-call 原样保留')
 })
 
 test('多个 reasoning 块：只留一个桩，其余删除', async () => {
-  const { handlers, appends, session } = setup()
+  const { handlers, appends, session } = setup({ reasoningMode: 'stub' })
   emit(handlers, session, makeEvent({
     content: undefined,
     data: { message: { content: [
@@ -128,8 +127,8 @@ test('drop 模式 + 纯 reasoning 消息：补空 text 块', async () => {
   assert.deepEqual(appends[0][1].message.content, [{ type: 'text', text: '' }])
 })
 
-test('可自定义桩模板', async () => {
-  const { handlers, appends, session } = setup({ stubTemplate: '<omitted {chars}>' })
+test('可自定义桩模板（stub 模式）', async () => {
+  const { handlers, appends, session } = setup({ reasoningMode: 'stub', stubTemplate: '<omitted {chars}>' })
   emit(handlers, session, makeEvent())
   await settle()
   assert.equal(appends[0][1].message.content[0].text, '<omitted 17>')
@@ -216,7 +215,7 @@ test('无 reasoning 的消息被跳过', async () => {
 })
 
 test('桩化模式下纯 reasoning 消息：保留桩块（不触发空内容兜底）', async () => {
-  const { handlers, appends, session } = setup()
+  const { handlers, appends, session } = setup({ reasoningMode: 'stub' })
   emit(handlers, session, makeEvent({ content: undefined, data: { message: { content: [{ type: 'reasoning', text: 'only thinking' }] } } }))
   await settle()
   assert.deepEqual(appends[0][1].message.content.map((b) => b.type), ['reasoning'])

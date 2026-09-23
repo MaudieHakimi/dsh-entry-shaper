@@ -36,8 +36,9 @@ const DEFAULTS = {
   enabled: true,
   // 是否处理 reasoning（总闸）
   dropReasoning: true,
-  // 'stub'（默认，短桩）| 'extract'（决策抽取：只留"我打算/下一步"那类句子）| 'drop'（整块删除，主对话路径会被 400）
-  reasoningMode: 'stub',
+  // 'extract'（默认，决策抽取：只留"我打算/下一步"那类句子，实测每档一致率都高于 stub）
+  // 'stub'（短桩）| 'drop'（整块删除，主对话路径会被 400）
+  reasoningMode: 'extract',
   stubTemplate: '[reasoning omitted: {chars} chars]',
   // extract 模式：决策句预算（字符）
   extractMaxChars: 240,

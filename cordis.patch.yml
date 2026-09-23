@@ -11,8 +11,11 @@
         # 单轮探针（1 轮工具往返）曾返回 200，属于特例，不能代表真实会话。
         # 规则边界正在用 bench/passback-rule.mjs 定位；在定论之前不要打开。
         enabled: false
-        # 当前唯一实现的塑形动作：摘掉 assistant/message 里的 reasoning 块
+        # 当前唯一实现的塑形动作：处理 assistant/message 里的 reasoning 块
         dropReasoning: true
+        # extract（默认，决策抽取：只留"我打算/下一步"那类句子）| stub（短桩）| drop（会被 400）
+        reasoningMode: extract
+        extractMaxChars: 240
         # 替换事件不带 usage（meter 按事件折算 usage，复制会翻倍）。
         # 若实测发现统计丢失（说明它按表面折算），改为 false。
         dropUsageOnReplace: true
