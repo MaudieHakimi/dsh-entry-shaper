@@ -637,6 +637,16 @@ test('代理适配器：转发时换成上游 provider，并把 messages 塑形'
   assert.equal(chunks[0].text, 'via:deepseek-official', '上游 chunk 原样透传')
 })
 
+test('代理适配器：shouldShape=false（哨兵/总闸关闭）时原样转发，不塑形', async () => {
+  const llm = fakeLlm()
+  const policy = { reasoning: { ops: [{ op: 'stub' }] }, toolResult: { ops: [{ op: 'keep' }] }, toolArgs: { ops: [{ op: 'keep' }] }, assistantText: { ops: [{ op: 'keep' }] } }
+  const adapter = createProxyAdapter({ llm, upstream: 'deepseek-official', policy, ctx: {}, shouldShape: () => false })
+  for await (const _ of adapter.stream({ provider: 'deepseek-shaped', messages: [assistantMsg()] })) { /* drain */ }
+  const forwarded = llm.captured[0]
+  assert.ok(forwarded.messages[0].content[0].text.startsWith('Exploring'), '急刹时应转发原文（完整推理）')
+  assert.equal(forwarded.provider, 'deepseek-official', '仍然要正常转发（不拒绝请求）')
+})
+
 test('代理适配器：listModels 照搬上游', async () => {
   const llm = fakeLlm()
   const adapter = createProxyAdapter({ llm, upstream: 'deepseek-official', policy: {}, ctx: {} })

@@ -459,9 +459,11 @@ export async function shapeMessages(messages, policy, ctx = {}) {
  * @param opts - { llm, upstream, policy, ctx }
  * @returns LlmAdapter 形状的对象（仅 runtime 需要的成员）
  */
-export function createProxyAdapter({ llm, upstream, policy, ctx }) {
+export function createProxyAdapter({ llm, upstream, policy, ctx, shouldShape = () => true }) {
   const proxyStream = async function* proxyStream(options) {
-    const messages = await shapeMessages(options?.messages, policy, ctx)
+    // 急刹与总闸在这里也要生效：不塑形就**原样转发**（而不是拒绝请求），
+    // 这样哨兵一建就立刻回到"没装插件"的行为，且不会打断任何正在进行的调用。
+    const messages = shouldShape() ? await shapeMessages(options?.messages, policy, ctx) : options?.messages
     const inner = llm.stream({ ...options, provider: upstream, messages })
     for await (const chunk of inner) yield chunk
   }
@@ -545,7 +547,15 @@ export function apply(ctx, config = {}) {
       } else {
         const alias = cfg.proxy.provider ?? 'deepseek-shaped'
         const upstream = cfg.proxy.upstream ?? 'deepseek-official'
-        const adapter = createProxyAdapter({ llm, upstream, policy: resolvePolicy(), ctx: baseOpCtx })
+        const shouldShape = () => {
+          const off = existsSync(OFF)
+          if (off && !stats.proxyOffNoted) {
+            stats.proxyOffNoted = true
+            log('proxy 侦测到哨兵文件 ⇒ 原样转发（不塑形）')
+          }
+          return cfg.enabled && cfg.dropReasoning && !off
+        }
+        const adapter = createProxyAdapter({ llm, upstream, policy: resolvePolicy(), ctx: baseOpCtx, shouldShape })
         llm.registerAdapter([alias], adapter)
         log(`proxy registered provider=${alias} upstream=${upstream}`
           + '（把 agent-default-model.provider 换成它即生效；日志与界面仍保留原文）')
@@ -574,6 +584,8 @@ export function apply(ctx, config = {}) {
 
   const shapeReasoningStream = (options, next) => {
     if (!cfg.enabled || !cfg.dropReasoning) return next(options)
+    // 急刹（哨兵）对流过滤同样要生效 —— 之前只在表面事件那条路检查，是个缺口。
+    if (existsSync(OFF)) return next(options)
     // 代理 provider 已启用时**必须**让流原样通过：否则内层转调（provider=upstream）会再次
     // 经过本中间件，推理就会被"在出生时"滤掉 ⇒ 日志又丢原文，代理的意义全没了。
     if (cfg.proxy?.enabled) {
