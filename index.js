@@ -473,14 +473,28 @@ export function createProxyAdapter({ llm, upstream, policy, getPolicy, ctx, shou
     const inner = llm.stream({ ...options, provider: upstream, messages })
     for await (const chunk of inner) yield chunk
   }
+  /**
+   * 借用上游的真实模型元数据（contextWindow / maxOutputTokens / reasoningEfforts…），
+   * 并把 `provider` **改盖成本路由 id**。为什么必须改盖：调用方
+   * `normalizeModelInfo()`（`llm/src/index.ts:663-683`）会校验
+   * `resolved.provider === 本路由 id`；直接转手上游元数据时 provider 是**上游 id**，
+   * 会被判为非法并抛 `INVALID_MODEL_INFO` ✗。
+   */
+  const borrowInfo = async (provider, model, signal) => {
+    let info
+    try { info = await llm.resolveModelInfo?.(upstream, model, signal) } catch { /* 拿不到就用最小信息 */ }
+    if (!info || typeof info !== 'object') return { provider, id: model, name: model }
+    return {
+      ...info,
+      provider,
+      id: model,
+      name: typeof info.name === 'string' && info.name.length > 0 ? info.name : model,
+    }
+  }
   return {
     async prepareCall(provider, model, signal) {
-      let info
-      try {
-        info = await llm.resolveModelInfo?.(upstream, model, signal)
-      } catch { /* 拿不到就用最小信息 */ }
       return {
-        model: info ?? { provider, id: model, name: model },
+        model: await borrowInfo(provider, model, signal),
         stream: (options) => proxyStream(options),
       }
     },
@@ -494,6 +508,23 @@ export function createProxyAdapter({ llm, upstream, policy, getPolicy, ctx, shou
     },
     providerInfo(provider) {
       return { id: provider, name: `${provider} (entry-shaper 代理)` }
+    },
+    /**
+     * 运行时**必调**的成员（注册期就调：`llm/src/index.ts:414`）。
+     * 基类 `LlmAdapter.providerRetryPolicy()` 本有默认实现（返回 undefined ⇒ 用 normal 默认策略），
+     * 但本适配器是**普通对象、不继承基类** ⇒ 少了它就是实测踩到的：
+     *   `proxy 注册失败（fail-open）：adapter.providerRetryPolicy is not a function`
+     * 这里优先借用上游自己的策略，拿不到就 undefined（等价于基类默认）。
+     */
+    providerRetryPolicy() {
+      try { return llm.providerRetryPolicy?.(upstream) } catch { return undefined }
+    },
+    /**
+     * 运行时**必调**（`llm/src/index.ts:659`，在 `resolveModelInfo()` 内部）。
+     * 语义与 `borrowInfo` 相同：基类默认只给 `{provider, id, name}`，我们额外带上游容量字段。
+     */
+    async resolveModel(provider, model, signal) {
+      return borrowInfo(provider, model, signal)
     },
   }
 }
@@ -586,52 +617,62 @@ export function apply(ctx, config = {}) {
   }
 
   // ── 代理 provider：wire 级塑形（可选）──
-  if (cfg.proxy?.enabled) {
+  // 注册是**惰性 + 可热开**的：apply() 时试一次，之后每次 LLM 调用前再试一次
+  // （`ensureProxy()`，未注册时成本 = 一次布尔判断）。理由：装配期一次性判定会让
+  // "开启代理"必须把插件关掉再打开；惰性注册则只需改热配置文件 ⇒ 真正免重启。
+  // 另外 llm 服务若在 apply 时尚未就绪，惰性重试能自愈（旧版直接放弃）。
+  let proxyRegistered = false
+  let proxyFailLogged = ''
+  const ensureProxy = () => {
+    if (proxyRegistered || !cfg.proxy?.enabled) return
     try {
       const llm = typeof ctx.get === 'function' ? ctx.get('llm') : undefined
-      if (!llm || typeof llm.registerAdapter !== 'function') {
-        log('proxy 已配置但拿不到 llm 服务 ⇒ 跳过（fail-open）')
-      } else {
-        const alias = cfg.proxy.provider ?? 'deepseek-shaped'
-        const upstream = cfg.proxy.upstream ?? 'deepseek-official'
-        /**
-         * 代理是否需要塑形：**任一**类别存在非 keep 的 op 才算需要。
-         * 旧判据是 `cfg.dropReasoning` ⇒ 只要关掉推理塑形，代理连工具结果/助手文本的塑形
-         * 一起放弃（代理本就服务所有类别，不该被推理开关挟持）。
-         */
-        const anyShaping = () => {
-          const policy = resolvePolicy()
-          for (const [kind, entry] of Object.entries(policy)) {
-            if (kind === 'reasoning' && cfg.shapeReasoning === false) continue
-            const ops = entry?.ops ?? []
-            if (ops.some((op) => op && op.op !== undefined && op.op !== 'keep')) return true
-          }
-          return false
+      if (!llm || typeof llm.registerAdapter !== 'function') return   // 服务未就绪 ⇒ 下次再试（不刷日志）
+      const alias = cfg.proxy.provider ?? 'deepseek-shaped'
+      const upstream = cfg.proxy.upstream ?? 'deepseek-official'
+      /**
+       * 代理是否需要塑形：**任一**类别存在非 keep 的 op 才算需要。
+       * 旧判据是 `cfg.dropReasoning` ⇒ 只要关掉推理塑形，代理连工具结果/助手文本的塑形
+       * 一起放弃（代理本就服务所有类别，不该被推理开关挟持）。
+       */
+      const anyShaping = () => {
+        const policy = resolvePolicy()
+        for (const [kind, entry] of Object.entries(policy)) {
+          if (kind === 'reasoning' && cfg.shapeReasoning === false) continue
+          const ops = entry?.ops ?? []
+          if (ops.some((op) => op && op.op !== undefined && op.op !== 'keep')) return true
         }
-        const shouldShape = () => {
-          refreshCfg()
-          const off = existsSync(OFF)
-          if (off && !stats.proxyOffNoted) {
-            stats.proxyOffNoted = true
-            log('proxy 侦测到哨兵文件 ⇒ 原样转发（不塑形）')
-          }
-          return cfg.enabled && !off && anyShaping()
-        }
-        const adapter = createProxyAdapter({
-          llm,
-          upstream,
-          getPolicy: resolvePolicy,   // 每次调用现算 ⇒ 配置热改立刻生效 ✓
-          ctx: baseOpCtx,
-          shouldShape,
-        })
-        llm.registerAdapter([alias], adapter)
-        log(`proxy registered provider=${alias} upstream=${upstream}`
-          + '（把 agent-default-model.provider 换成它即生效；日志与界面仍保留原文）')
+        return false
       }
+      const shouldShape = () => {
+        refreshCfg()
+        const off = existsSync(OFF)
+        if (off && !stats.proxyOffNoted) {
+          stats.proxyOffNoted = true
+          log('proxy 侦测到哨兵文件 ⇒ 原样转发（不塑形）')
+        }
+        return cfg.enabled && !off && anyShaping()
+      }
+      const adapter = createProxyAdapter({
+        llm,
+        upstream,
+        getPolicy: resolvePolicy,   // 每次调用现算 ⇒ 配置热改立刻生效 ✓
+        ctx: baseOpCtx,
+        shouldShape,
+      })
+      llm.registerAdapter([alias], adapter)
+      proxyRegistered = true
+      log(`proxy registered provider=${alias} upstream=${upstream}`
+        + '（把 agent-default-model.provider 换成它即生效；日志与界面仍保留原文）')
     } catch (error) {
-      log(`proxy 注册失败（fail-open）：${error?.message ?? error}`)
+      const message = String(error?.message ?? error)
+      if (message !== proxyFailLogged) {
+        proxyFailLogged = message
+        log(`proxy 注册失败（fail-open，下次调用会重试）：${message}`)
+      }
     }
   }
+  ensureProxy()
 
   /**
    * ── 推理的塑造走"流过滤"，不走表面替换 ──
@@ -652,6 +693,9 @@ export function apply(ctx, config = {}) {
 
   const shapeReasoningStream = (options, next) => {
     refreshCfg()
+    // 每次 LLM 调用前顺手确保代理已注册（未注册时成本 = 一次布尔判断）。
+    // 放在这里是因为"配置里打开了 proxy"必须能**当场生效**，而不是等一次重挂载。
+    ensureProxy()
     // 这条通道**只**服务推理 ⇒ 判据就该是"要不要塑形推理"（与 enabled 一起）。
     if (!cfg.enabled || cfg.shapeReasoning === false) return next(options)
     // 急刹（哨兵）对流过滤同样要生效 —— 之前只在表面事件那条路检查，是个缺口。

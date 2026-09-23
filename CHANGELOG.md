@@ -2,6 +2,38 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与语义化版本。
 
+## [0.9.2] — 2026-09-23
+
+**代理适配器补齐运行时契约 + 代理改为惰性可热开。**
+
+### Fixed
+
+- **代理注册失败**（实测现场日志）：`proxy 注册失败（fail-open）：adapter.providerRetryPolicy is not a function`。
+  根因：`createProxyAdapter()` 返回的是**普通对象**，而运行时要求适配器实现
+  `llm/src/index.ts` 中被调用的**全部**成员（409 `providerInfo`、414 `providerRetryPolicy`、
+  610 `listModels`、659 `resolveModel`、826/910 `prepareCall`、`stream`）。基类 `LlmAdapter`
+  本有这些默认实现，普通对象没有 ⇒ 注册期直接抛错。现在补齐 `providerRetryPolicy()`
+  （借用上游策略，拿不到则返回 `undefined` = 基类默认）与 `resolveModel()`。
+- **`resolveModel()` 必须改盖 provider**：`normalizeModelInfo()`（同文件 663-683）校验
+  `resolved.provider === 本路由 id`、`resolved.id === model`、`name` 非空；直接转手上游
+  元数据会因为 provider 是**上游 id** 而抛 `INVALID_MODEL_INFO` ⇒ 借用容量字段的同时把
+  provider 改盖成别名。
+
+### Changed
+
+- **代理改为惰性注册**：装配期一次性判定会让"开启代理"必须重挂载插件。现在 `ensureProxy()`
+  在 apply 时试一次、之后每次 LLM 调用前再试一次（未注册时成本 = 一次布尔判断）
+  ⇒ 只改热配置文件即可开启代理，**不必重挂载**；llm 服务在 apply 时尚未就绪也能自愈
+  （旧版直接放弃）。
+- 注册失败改为**去重日志 + 保留重试**（旧版会每次调用都重新失败）。
+
+### 测试 59/59
+
+新增 2 例：① 断言适配器满足运行时的**全部**成员要求（正是这条能抓住
+`providerRetryPolicy is not a function`），并验证 `resolveModel` 改盖 provider、
+以及上游信息完全缺失时的合法最小兜底；② 惰性注册 —— 热开 `proxy` 后下一次 LLM 调用
+即完成注册。
+
 ## [0.9.1] — 2026-09-23
 
 **开关语义修正：`dropReasoning` → `shapeReasoning`，并把它从"总闸"降回"只管推理"。**

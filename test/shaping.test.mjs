@@ -617,6 +617,9 @@ function fakeLlm() {
     async listModels() {
       return [{ id: 'deepseek-flash', name: 'v4.1-flash' }]
     },
+    providerRetryPolicy(provider) {
+      return { provider, maxAttempts: 3 }
+    },
     registerAdapter(providers, adapter) {
       this.registered = { providers, adapter }
     },
@@ -628,7 +631,37 @@ test('代理适配器：prepareCall 带上游真实模型元数据（含 context
   const adapter = createProxyAdapter({ llm, upstream: 'deepseek-official', policy: {}, ctx: {} })
   const prepared = await adapter.prepareCall('deepseek-shaped', 'deepseek-flash')
   assert.equal(prepared.model.contextWindow, 1000000, '必须借用上游元数据，否则丢掉窗口信息')
+  assert.equal(prepared.model.provider, 'deepseek-shaped', 'provider 必须改盖成别名路由 id')
   assert.equal(typeof prepared.stream, 'function')
+})
+
+test('代理适配器：满足运行时对适配器的**全部**成员要求（缺一个就注册失败，实测踩过）', async () => {
+  const llm = fakeLlm()
+  const adapter = createProxyAdapter({ llm, upstream: 'deepseek-official', policy: {}, ctx: {} })
+  // 运行时调用点（llm/src/index.ts）：409 providerInfo、414 providerRetryPolicy、
+  // 610 listModels、659 resolveModel、826/910 prepareCall、stream。
+  for (const member of ['providerInfo', 'providerRetryPolicy', 'listModels', 'resolveModel', 'prepareCall', 'stream']) {
+    assert.equal(typeof adapter[member], 'function', `适配器必须实现 ${member}()`)
+  }
+  // 基类 LlmAdapter 本有默认实现，但本适配器是普通对象 ⇒ 必须自己给（否则注册期就抛
+  // "adapter.providerRetryPolicy is not a function"）
+  assert.deepEqual(adapter.providerRetryPolicy('deepseek-shaped'), { provider: 'deepseek-official', maxAttempts: 3 },
+    '重试策略应借用上游')
+  assert.deepEqual(adapter.providerInfo('deepseek-shaped'), { id: 'deepseek-shaped', name: 'deepseek-shaped (entry-shaper 代理)' })
+
+  // resolveModel 的关键约束：normalizeModelInfo()（llm/src/index.ts:663-683）要求
+  // resolved.provider === 本路由 id、resolved.id === model、name 非空
+  const resolved = await adapter.resolveModel('deepseek-shaped', 'deepseek-flash')
+  assert.equal(resolved.provider, 'deepseek-shaped', 'provider 必须是本路由 id，否则抛 INVALID_MODEL_INFO')
+  assert.equal(resolved.id, 'deepseek-flash')
+  assert.equal(resolved.contextWindow, 1000000, '容量字段照搬上游')
+  assert.ok(typeof resolved.name === 'string' && resolved.name.length > 0, 'name 不能为空')
+
+  // 上游什么都拿不到时也必须给出合法最小信息（不能抛）
+  const bare = createProxyAdapter({ llm: { stream: () => (async function* () {})() }, upstream: 'up', policy: {}, ctx: {} })
+  const fallback = await bare.resolveModel('alias', 'm1')
+  assert.deepEqual(fallback, { provider: 'alias', id: 'm1', name: 'm1' })
+  assert.equal(bare.providerRetryPolicy('alias'), undefined, '拿不到上游策略 ⇒ undefined（等价基类默认）')
 })
 
 test('代理适配器：转发时换成上游 provider，并把 messages 塑形', async () => {
@@ -674,6 +707,37 @@ test('插件启动：proxy.enabled 时注册代理 provider；拿不到 llm 服�
 
   const noLlmCtx = { on: () => () => {}, get: () => undefined }
   assert.doesNotThrow(() => apply(noLlmCtx, { logPath: join(TMP, 'proxy-nollm.log'), offSentinel: join(TMP, 'no.OFF'), configPath: join(TMP, 'proxy-nollm-cfg-none.json'), proxy: { enabled: true } }))
+})
+
+test('代理：惰性注册 —— 用热配置打开 proxy 后，下一次 LLM 调用即完成注册（无需重挂载）', async () => {
+  caseNo += 1
+  const cfgPath = join(TMP, `lazy-proxy-${caseNo}.json`)
+  const logPath = join(TMP, `lazy-proxy-${caseNo}.log`)
+  writeFileSync(cfgPath, JSON.stringify({ enabled: true, proxy: { enabled: false } }), 'utf8')
+
+  const registered = []
+  const listeners = []
+  const llm = fakeLlm()
+  llm.registerAdapter = (providers, adapter) => { registered.push({ providers, adapter }) }
+  const ctx = {
+    on: (name, handler) => { listeners.push({ name, handler }); return () => {} },
+    get: (name) => (name === 'llm' ? llm : undefined),
+  }
+  apply(ctx, { logPath, offSentinel: join(TMP, 'no.OFF'), configPath: cfgPath })
+  assert.equal(registered.length, 0, '配置里 proxy 未开 ⇒ 启动时不注册')
+
+  // 热改配置打开 proxy，然后只跑一次 LLM 中间件（模拟真实调用的第一跳）
+  await new Promise((r) => setTimeout(r, 20))
+  writeFileSync(cfgPath, JSON.stringify({
+    enabled: true,
+    proxy: { enabled: true, provider: 'shaped-lazy', upstream: 'deepseek-official' },
+  }), 'utf8')
+  const middleware = listeners.find((l) => l.name === 'llm/stream').handler
+  const source = (async function* () { yield { type: 'text', text: 'x' } })()
+  for await (const _chunk of middleware({ provider: 'deepseek-official', messages: [] }, () => source)) { /* drain */ }
+
+  assert.equal(registered.length, 1, '热开 proxy 后应在下一次调用时完成注册 —— 这就是"免重挂载"')
+  assert.deepEqual(registered[0].providers, ['shaped-lazy'])
 })
 
 test('热配置：改配置文件无需重启即生效（按 mtime 热读）', async () => {
