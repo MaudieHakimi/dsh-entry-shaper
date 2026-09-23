@@ -1,20 +1,41 @@
 # 安全说明
 
-本插件**很小**，但它在会话表面上动刀，所以把边界写清楚。
+本插件**很小**，但它既在会话表面上动刀、又会注册一个 LLM 路由，所以把边界写清楚。
 
 ## 它做什么
 
-订阅 `session/event`，对**刚追加、尚未发送**的 `assistant/message` 追加一条**同类**表面事件
-（`surfaceOp: { op: 'replace' }`），其内容是原消息**去掉 `reasoning` 块**。原始事件仍在
-append-only 日志里；替换副本是 **model-only**（界面/审计读 append-origin 事件）。
+两条通道，**默认都关**（`enabled: false`；代理还需 `proxy.enabled: true`）：
+
+1. **wire 级代理**（推荐、默认路径）：`llm.registerAdapter()` 注册一个新 provider 路由，
+   把 `deriveMessages()` 产出的 messages **按类别跑 op 链**后，转交上游 provider
+   （`llm.stream({ …options, provider: <upstream> })`）。**会话与日志完全不动**，
+   只有发出去的那一份被塑形。
+2. **表面替换**（实验性、默认关）：订阅 `session/event`，对**刚追加、尚未发送**的事件追加
+   同类表面事件（`surfaceOp: { op: 'replace' }`）。原始事件仍在 append-only 日志里；
+   替换副本是 **model-only**（界面/审计读 append-origin 事件）。
 
 ## 它不做什么
 
 - **不接管 `compaction` 服务**（与官方 `dsh-compaction-basic`、`dsh-context-slimmer` 共存）；
-- **不改写已发送的内容**（那会打断前缀缓存并付全价税——这正是本插件要避免的事）；
-- **不发起任何网络请求**（无端点、无 LLM 调用；`summarize:llm` 是规划项，见 `docs/PROCESSING.md`）；
-- **不读写用户文件**（除自身日志 `~/.dsh-entry-shaper.log` 与熔断哨兵 `~/.dsh-entry-shaper.OFF`）；
-- **不记录任何消息内容**到日志（只记 seq / turn / step / 块数 / 字符数）。
+- **不改写已发送的内容**（那会打断前缀缓存并付全价税 —— 这正是本插件要避免的事）；
+- **不自己发 HTTP**：代理把请求交回 `llm` 服务 ⇒ **凭据由 llm 服务按上游 provider id 解析**
+  （`~/.dsh/.credentials.yaml`），本插件不读取、不存储、不转发任何 API key；
+- **不记录任何消息内容**：日志只记 seq / turn / step / 块数 / 字符数 / 策略名。
+
+## 它会访问什么（按你打开的配置）
+
+| 能力 | 何时发生 | 触及什么 |
+|---|---|---|
+| 写日志 | 只要 `logStats`（默认开） | `~/.dsh-entry-shaper.log`（**只记字符数，不记内容**） |
+| 读配置 | 每次调用前按 mtime 检查 | `~/.dsh-entry-shaper.config.json`（你自己的文件） |
+| 读哨兵 | 每 64 事件 / 每次出网 | `~/.dsh-entry-shaper.OFF`（存在即停手） |
+| 读写结果缓存 | 仅当用了**非纯 op**（`summarize` / `python`）且 `cache.enabled` | `~/.dsh-entry-shaper.cache.jsonl`（**只存塑形后的摘要，不存原文**；8 MB 上限 + 轮转） |
+| **发 HTTP** | 仅当你使用 `summarize` op，或打开代理通道（转调上游 LLM） | 你配置的 endpoint；`summarize` 的 apiKey 依次取 `op.apiKey → llm.apiKey → DEEPSEEK_API_KEY` |
+| **起子进程** | 仅当你使用 `python` op | 你配置的 `script` / `command`；收 stdin JSON，读 stdout |
+
+> ⚠️ **`python` op 会执行你指定的本地脚本，`summarize` op 会把待塑形文本发到你指定的
+> endpoint。** 两者都由你的配置显式启用，请只指向你自己信任的脚本与端点。
+> 若你在 `redact` 槽位里注入了脱敏函数，`summarize` 的出网文本会先经它处理。
 
 ## 失败模式
 
@@ -22,14 +43,26 @@ append-only 日志里；替换副本是 **model-only**（界面/审计读 append
 |---|---|
 | 事件结构不符合预期 | 直接 return，零副作用 |
 | `session.append` 被表面契约拒绝 | 捕获、写日志、**表面保持原样**（fail-open） |
-| 日志不可写 | 静默忽略 |
-| 需要紧急停手 | 建空文件 `~/.dsh-entry-shaper.OFF`（免重启，每 64 事件检查一次） |
+| 代理注册失败（缺成员 / 服务未就绪） | 写一条去重日志，**下次调用重试**；请求照常走原路由 |
+| 某个 op 超时或抛错 | **只跳过该 op**，保留上一步结果（fail-open）⇒ 最坏是"没省到" |
+| 日志 / 缓存不可写 | 静默忽略，不影响会话 |
+| 哨兵文件存在 | 原样转发（不塑形），**不拒绝请求** ⇒ 不会打断正在进行的调用 |
+| 需要紧急停手 | 建空文件 `~/.dsh-entry-shaper.OFF`（免重启，立刻原样转发） |
 
 ## 数据面影响
 
-- **模型看到的内容变少**（设计使然）：后续请求不再携带历史推理；
-- **人类看到的内容不变**：界面与审计仍读 append 原文；
-- **token 统计不变**：替换事件不复制 `usage`（否则会双计）。
+- **模型看到的内容变少**（设计使然，**有损**）：历史推理只保留决策句（默认 240 字符预算），
+  探索与试错过程不进 payload；
+- **人类看到的内容不变**：界面与审计仍读 append 原文（这也是"感觉变简短但日志是全的"的原因）；
+- **token 统计不变**：表面替换不复制 `usage`（否则会双计）；
+- **前缀不变**（设计目标）：塑形是纯函数，非纯 op 走内容哈希缓存 ⇒ 同一条旧消息每次出网形态恒定。
+
+## 边界（有意的取舍）
+
+- 本插件**不做脱敏**：没有任何内置的密钥/隐私识别规则。要脱敏请在 `redact` 槽位注入你自己的
+  函数（`summarize` 出网前会调用它）。**不要指望它替你挡住密钥泄漏**；
+- 本插件**不校验上游**：代理只是把请求转发给 `proxy.upstream` 指定的路由，
+  该路由是不是你以为的那个，取决于你的 `settings.yaml` / 凭据配置。
 
 ## 报告问题
 

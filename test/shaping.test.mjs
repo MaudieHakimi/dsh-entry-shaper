@@ -693,6 +693,38 @@ test('代理适配器：listModels 满足宿主目录校验（provider 必须改
   assert.deepEqual(await broken.listModels('alias'), [])
 })
 
+test('代理适配器：onShaped 上报省了多少字符（不依赖外部抓包的自证手段）', async () => {
+  const llm = fakeLlm()
+  const policy = { reasoning: { ops: [{ op: 'stub' }] }, toolResult: { ops: [{ op: 'keep' }] }, toolArgs: { ops: [{ op: 'keep' }] }, assistantText: { ops: [{ op: 'keep' }] } }
+  const seen = []
+  const adapter = createProxyAdapter({
+    llm, upstream: 'deepseek-official', policy, ctx: { stubTemplate: '[omitted {chars}]' },
+    onShaped: (info) => seen.push(info),
+  })
+  for await (const _chunk of adapter.stream({ provider: 'deepseek-shaped', messages: [assistantMsg()] })) { /* drain */ }
+
+  assert.equal(seen.length, 1, '塑形发生时应上报一次')
+  assert.ok(seen[0].before > seen[0].after, `应显示缩减：${seen[0].before} → ${seen[0].after}`)
+  // 口径：整条 messages 的字符总量（推理 + 文本 + 工具参数），不是只算被改的那个块。
+  // 期望值直接由 shapeMessages 现算 —— 不手抄数字（我第一版手抄错了 8 个字符）。
+  const measured = (msgs) => msgs.reduce(
+    (n, m) => n + (m.content ?? []).reduce(
+      (k, b) => k + (typeof b.text === 'string' ? b.text.length : typeof b.arguments === 'string' ? b.arguments.length : 0), 0), 0)
+  const stubCtx = { stubTemplate: '[omitted {chars}]' }
+  const shaped = await shapeMessages([assistantMsg()], policy, stubCtx)
+  assert.equal(seen[0].before, measured([assistantMsg()]), 'before 应是整条 messages 的字符量')
+  assert.equal(seen[0].after, measured(shaped), 'after 应与实际塑形结果一致')
+  assert.equal(shaped[0].content[0].text, '[omitted 403]', '前提：推理原文 403 字符 ⇒ 短桩 13 字符')
+
+  // 不塑形（shouldShape=false）时不上报 —— 避免把"原样转发"记成"省了 0%"
+  const off = createProxyAdapter({
+    llm, upstream: 'deepseek-official', policy, ctx: {}, shouldShape: () => false,
+    onShaped: (info) => seen.push(info),
+  })
+  for await (const _chunk of off.stream({ provider: 'deepseek-shaped', messages: [assistantMsg()] })) { /* drain */ }
+  assert.equal(seen.length, 1, '未塑形不应上报')
+})
+
 test('代理适配器：转发时换成上游 provider，并把 messages 塑形', async () => {
   const llm = fakeLlm()
   const policy = { reasoning: { ops: [{ op: 'stub' }] }, toolResult: { ops: [{ op: 'keep' }] }, toolArgs: { ops: [{ op: 'keep' }] }, assistantText: { ops: [{ op: 'keep' }] } }

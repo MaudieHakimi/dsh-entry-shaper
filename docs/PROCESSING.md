@@ -97,20 +97,39 @@ config:
     summarize: { maxTokens: 256, timeoutMs: 5000, useSessionTools: false }
 ```
 
-## 6. 里程碑
+## 6. 里程碑（对照实际状态，2026-09-23）
 
-| # | 内容 | 依赖 |
+| # | 内容 | 状态 |
 |---|---|---|
-| M1 | reasoning 的 `drop` / `keep-last-k`（可配置 k） | 已完成 drop；keep-last-k 待做 |
-| M2 | tool 结果的 `stub`（首尾桩） | 需要实测"当步质量"代价 |
-| M3 | `summarize:llm`（OpenAI 标准 URL + 显式提示词 + 脱敏 + 失败 skip） | M2 的质量结论 |
-| M4 | `shaper` 槽位化（库包/组合包两种写法 + `report-only`） | M1–M3 稳定后 |
-| M5 | tool-args 的 `stub`（风险最高，最后做） | M2 的结论外推 |
+| M1 | reasoning 的 `drop` / `keep-last-k`（可配置 k） | ✅ `drop`/`stub`/`extract`/`head`/`truncate` 均已实现；**`keep-last-k` 已否决**（有状态策略 ⇒ 同一条旧消息在不同出网批次形态不同 ⇒ 破坏前缀，见 §7） |
+| M2 | tool 结果的 `stub`（首尾桩） | ✅ 已实现（`toolResult` + `truncate`），**默认仍 `keep`** —— 官方 `tool-result-pruner`（8192/4096/1024）已在做，先别重复造轮子 |
+| M3 | `summarize:llm`（OpenAI 标准 URL + 显式提示词 + 脱敏 + 失败 skip） | ✅ 已实现，**带结果缓存**（非纯 op 不缓存 ⇒ 前缀抖动 ⇒ 断点税） |
+| M4 | `shaper` 槽位化（库包/组合包两种写法 + `report-only`） | ⏳ 未做。当前是内置 op 表 + `policy` 配置；槽位化的动机在 `dsh-slimmer-seams` 里另行验证过 |
+| M5 | tool-args 的 `stub`（风险最高，最后做） | ⏳ 未做（默认 `keep`）；风险与 M2 不同：参数一旦改坏，工具会**执行错**而不是"答复变差" |
+| M6 | **wire 级代理通道**（原计划里没有） | ✅ 已完成并实测：出网 −40.1%、缓存命中 99.3%、日志/界面保留原文 ⇒ **取代**了原先"表面替换"的路线（那条路被两个互相矛盾的校验器堵死，见 `index.js` 顶部注释） |
+| M7 | 可热挂载 + 配置热读 + 免重启熔断 | ✅ patch 纯 insert（市场可热挂载）、配置放 `~/.dsh-entry-shaper.config.json` 热读、哨兵即停 |
+
+**被数据否掉的方案**（别再试）：
+
+| 方案 | 否掉的理由 |
+|---|---|
+| 表面替换 `assistant/message` | `surface.ts:241` 要求 `sourceEventSeqs` 含被替换节点自身，`token-meter/src/index.ts:279-304` 要求每项都是同 step 的 `assistant/chunk` —— **两者矛盾** ⇒ 这条路是死的 |
+| `keep-last-k`（只留最近 k 条推理） | 有状态 ⇒ 同一条旧消息两次出网形态可能不同 ⇒ 前缀改变 ⇒ 付断点税 |
+| 在线成本 A/B | 两臂共享前缀 ⇒ 后跑的那臂几乎全命中 ⇒ 数字是缓存复用假象（实测出一版 −77%，已撤回） |
+| `stub-tail` / `keep-tail` | 行为分歧实测 59% vs `extract` 的 76% ⇒ 更差 |
 
 ## 7. 怎么判断"调参调对了"
 
 - **钱**：`dsh-context-slimmer/tools/session-cost-audit.mjs` —— 看每步输入是否下降、
   未命中是否**没有**整份 payload 尖峰（有尖峰 = 引入了断点税，说明时机错了）；
-- **量**：`~/.dsh-entry-shaper.log` 的累计 chars → token 估算；
-- **质**：固定任务集 A/B（开/关各若干次），指标 = 任务成功率 / 返工步数 / 结论保真；
-  这三项目前**全部未测**，任何"不影响质量"的说法在测出来之前都不成立。
+- **量（不依赖外部工具）**：`~/.dsh-entry-shaper.log` 里的
+  `proxy-shape #n chars=A→B（累计 …）` —— 这是本插件自己的出网字符统计；
+  要看**真实出网内容**再用 `dsh-llm-tap`（`~/.dsh-llm-tap/llm-tap.jsonl`）核对；
+- **质**：固定任务集 A/B（开/关各若干次），指标 = 任务成功率 / 返工步数 / 结论保真。
+  agentic 基准目前**未观察到退化**（短任务 8/8、长轨迹 3/3），但任务规模仍小于真实长会话
+  ⇒ 任何"不影响质量"的强断言在更长轨迹上测出来之前都不成立。
+
+> **一条与"调参"无关但更重要的判据**：只要 `cacheReadTokens / (cacheReadTokens + inputTokens)`
+> 保持在 99% 量级且每步命中量按新增量平稳递增，就说明前缀没被打断 ——
+> 这比"省了多少"更能说明健康度。
+

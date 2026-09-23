@@ -2,6 +2,31 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与语义化版本。
 
+## [0.9.4] — 2026-09-23
+
+**发版前的文档与自证能力补齐。**
+
+### Added
+
+- **`proxy-shape` 自证日志**：每次代理塑形都记账（前 3 次 + 之后每 20 次一行），
+  格式 `proxy-shape #n chars=A→B（本次 −X%；累计 A→B = −Y%）`。
+  动机：在此之前"到底省了多少"只能靠第三方抓包（`dsh-llm-tap`）看，用户装了插件
+  却无法自证；现在**看一眼自己的日志就够**。日志只记字符数，不记内容 ✓。
+  `createProxyAdapter()` 相应新增 `onShaped({ before, after })` 回调（可注入，便于测试）。
+- `README.md` **全文重写**：修掉三处已经过期的内容 ——
+  ① 旧版把 `config:` 写进 `cordis.patch.yml`（那正是**导致无法热挂载**的写法）；
+  ② 旧版用 `dropReasoning`（现名 `shapeReasoning`）；③ 测试数与"只做 reasoning"的描述过期。
+  新增：目录、三种挂载方式对照、热挂载的两条硬限制、故障排查表、`docs/OFFICIAL-STACK.md` 入口。
+- `docs/PROCESSING.md` 里程碑表按**实际状态**重写（M1–M7），并新增两节：
+  **被数据否掉的方案**（表面替换 / `keep-last-k` / 在线 A/B / `stub-tail`）与
+  **健康度判据**（命中率 + 每步命中量是否按新增量平稳递增，比"省了多少"更重要）。
+
+### 测试 61/61
+
+新增 1 例：`onShaped` 上报的 `before` / `after` 必须与实际 `shapeMessages()` 结果一致，
+且**未塑形时不上报**（否则会把"原样转发"记成"省了 0%"）。
+（注：该用例第一版手抄字符数抄错了 8 个字符 —— 现已改为直接用 `shapeMessages()` 现算期望值。）
+
 ## [0.9.3] — 2026-09-23
 
 **代理在模型选择器里"整组消失"的根因修复：`listModels()` 也必须改盖 provider。**

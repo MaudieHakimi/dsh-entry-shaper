@@ -3,19 +3,52 @@
 > 把上下文压缩从**出口**挪到**入口**：元素在被首次发送之前定型，此后永不改写 ⇒
 > payload 前缀永远单调 ⇒ **零断点税**地缩小上下文。
 
-**状态**：实验性 · **默认关闭** · 测试 17/17 · [为什么默认关闭](#现状与限制)
+**状态**：实验性 · **默认关闭** · 测试 61/61 · Node ≥ 20 · MIT
+
+**实测**（本机真实会话 + 真实 API）：出网 payload **−40.1%**，缓存命中率 **99.3%**，
+日志与界面保留原文。取证方法见[§ 实测数据](#实测数据)。
 
 ---
 
-## 问题
+## 目录
 
-DSH 的 `compaction` 在**出口**改历史：把已发送的区间换成检查点。这有效，但每一刀都会打断
-前缀缓存——从改动点往后**整份 payload 全价重发**（"断点税"）。在缓存命中价极低的 provider 上
-（DeepSeek 命中/未命中 ≈ 1/50），这笔税常常比省下的钱还贵。
+- [问题：压缩为什么常常是亏的](#问题压缩为什么常常是亏的)
+- [做法：在入口定型](#做法在入口定型)
+- [它是什么 / 不是什么](#它是什么--不是什么)
+- [官方栈已经做了什么（先读这个）](#官方栈已经做了什么先读这个)
+- [安装](#安装)
+- [配置](#配置)
+- [三种挂载方式](#三种挂载方式)
+- [可用 op](#可用-op)
+- [栈护栏](#栈护栏)
+- [实测数据](#实测数据)
+- [现状与限制](#现状与限制)
+- [故障排查](#故障排查)
+- [文档](#文档)
+- [开发](#开发)
+- [许可](#许可)
 
-## 做法
+## 问题：压缩为什么常常是亏的
 
-会话是一根**只进不出的栈**。元素在被**首次回传之前**定型，前缀里就从来没出现过它的旧形态：
+DSH 的 `compaction` 在**出口**改历史：把已发送的区间换成摘要检查点。这有效，但每一刀都会
+打断前缀缓存 —— 从改动点往后**整份 payload 按全价重算**（"断点税"）。在缓存命中价极低的
+provider 上（DeepSeek 命中/未命中 ≈ **1/50**），这笔税常常比省下的钱还贵。
+
+本机实测（会话 `session-acde5be7-…`，见 [`docs/OFFICIAL-STACK.md`](docs/OFFICIAL-STACK.md)）：
+
+| 通道 | 削掉的 token | 全价重算（断点税） | 比值 |
+|---|---|---|---|
+| 官方 `compaction-basic` **自动压缩 109 笔合计** | 3,021,022 | **6,282,630** | **0.48 : 1** ✗ 净亏 2 倍 |
+| 其中最差的一笔 | 64,891 | 547,342 | 0.12 : 1 ✗ |
+| 人类手动 `/compact`（一次打到底） | 729,434 | 6,176 | **118 : 1** ✓ |
+
+机制在 `packages/compaction/compaction-basic/src/region.ts:98-133`：区间是**头锚定**的
+（从最早的表面节点起切到"保留尾部"之前）⇒ 检查点落在**头部** ⇒ 它后面的缓存全部作废。
+**削得越少越亏**：税 ≈ 压缩后整份 payload，收益 = 实际削掉的量。
+
+## 做法：在入口定型
+
+会话是一根**只进不出的栈**。元素在**首次回传之前**定型，前缀里就从来没出现过它的旧形态：
 
 ```
 请求 n   : [S][T][U][1'][2']…[n-1']
@@ -23,144 +56,176 @@ DSH 的 `compaction` 在**出口**改历史：把已发送的区间换成检查�
            └──────── 逐字相同的前缀（全命中）────────┘ └ 新增 ┘
 ```
 
-本插件当前只做一件事：把 `assistant` 消息里的 `reasoning`（思考）**换成一个短桩**。
-推理的量很大（实测占追加内容 34.8%），而它**生成于本次调用、首次回传在下一次请求** ——
-唯一的定型窗口就在这两者之间。
+本插件的**代理通道**把这件事放在 wire 层：拿 `deriveMessages()` 产出的消息数组，
+按类别跑 op 链，再交给上游 provider。**会话与日志完全不动**，只有发出去的那一份被塑形。
 
 ## 它是什么 / 不是什么
 
 | | |
 |---|---|
-| ✅ 表面层插件，订阅 `session/event`，用 `surfaceOp: { op: 'replace' }` 定型 | ❌ 不接管 `compaction` 服务（与官方 `dsh-compaction-basic`、`dsh-context-slimmer` 共存） |
-| ✅ 原文仍在 append-only 日志里；替换副本是 **model-only**，界面/审计读 append 原文 | ❌ 不改写**已发送**的内容（那是"出口压缩"的领域，要付断点税） |
-| ✅ 失败即放行（fail-open）：任何异常只写日志，表面保持原样 | ❌ 不发起任何网络请求、不读写用户文件（除自身日志与熔断哨兵）；日志不记录消息内容 |
+| ✅ 代理 provider：`llm.registerAdapter()` 注册一个新路由，转调上游 | ❌ 不接管 `compaction` 服务（可与官方 `dsh-compaction-basic`、`dsh-context-slimmer` 共存） |
+| ✅ 原文永远在 append-only 日志里；界面与审计读原文 | ❌ 不改写**已发送**的内容（那是"出口压缩"的领域，要付断点税） |
+| ✅ 塑形是**纯函数**（或带缓存的非纯 op）⇒ 同一条旧消息每次出网形态恒定 ⇒ 前缀稳定 | ❌ 不自己发 HTTP：凭据仍由 llm 服务按上游 id 解析（**不需要新 API key**） |
+| ✅ 失败即放行（fail-open）：任何异常只写日志，请求照常发 | ❌ 日志不记录消息内容（只记字符数与策略名） |
 
-## 快速开始
+## 官方栈已经做了什么（先读这个）
+
+**DSH 自带栈里已经有一个确定性免费剪枝器和一个摘要压缩器。** 装本插件之前请先确认你要的是
+本插件的空位：
+
+| 组件 | 触发条件 | 代价 | 模型视角 |
+|---|---|---|---|
+| `tool-result-pruner`（默认**开**） | 单条 tool result > `thresholdChars`（8192） | **零**（纯函数、逐条独立 ⇒ 不破前缀） | 中段换成剪枝标记，保留头 4096 + 尾 1024 |
+| `compaction-basic`（默认**开**） | prompt 达 `thresholdRatio × 窗口`（0.8），保留 `retainRatio`（0.16） | **一次断点**（全价重算） | 老历史被 LLM 摘要**取代**（不可逆） |
+| **本插件** | 每次出网 | **零**（前缀单调） | 按类别塑形后的版本；原文仍在日志里 |
+
+**空位只有三处**：① 推理内容（官方剪枝器完全不碰，而它是日志里最大宗的 payload：
+本机 40,916 条 `reasoning-chunks` vs 20,570 条 `assistant/chunk`）；
+② 按类别的策略（官方只有一个全局字符阈值）；③ 保留原文的 wire 级塑形（压缩不可逆）。
+
+细节与出处：[`docs/OFFICIAL-STACK.md`](docs/OFFICIAL-STACK.md)。
+
+## 安装
 
 ```powershell
-# 安装（profile 名按需替换）
-dsh plugin --profile web add "file:D:\DSH Desktop\dsh-entry-shaper"
+# 路径换成你放本包的位置
+dsh plugin --profile web add "file:D:\plugins\dsh-entry-shaper"
 ```
 
-或手动：把目录复制进 `<profile>\node_modules\`，并在 profile 的 `package.json` 中把
-`dsh-entry-shaper` 加进 `dependencies` 与 `dsh.profile.bundles`（后者决定它是否被加载）。
+或手动：把目录复制进 `<profile>\node_modules\`，并把 `dsh-entry-shaper` 加进 profile
+`package.json` 的 `dependencies` **与 `dsh.profile.bundles`**（后者决定它是否被加载；
+`dsh.bundle.patch` 必须仍指向本包的 `cordis.patch.yml`，否则启动即抛错）。
 
-配置（`cordis.patch.yml`）——**处理层是可组合的 op 序列**：
+## 配置
 
-```yaml
-- insert:
-    - id: dsh-entry-shaper
-      name: dsh-entry-shaper
-      config:
-        enabled: false             # 默认关闭；确认可接受质量代价后再打开
-        dropReasoning: true        # 是否处理 reasoning（总闸）
-        policy:                    # 按内容类别各给一条 op 序列（文本 → 文本 的纯函数链）
-          reasoning:      { ops: [{ op: extract, maxChars: 240 }] }               # 决策抽取
-          toolResult:     { ops: [{ op: truncate, maxChars: 1024 }] }             # 首尾桩；默认 keep
-          toolArgs:       { ops: [{ op: keep }] }
-          assistantText:  { ops: [{ op: keep }] }
-        dropUsageOnReplace: true   # 替换事件不带 usage（否则 token 统计双计）
+**配置一律放在 `~/.dsh-entry-shaper.config.json`，不要写进 `cordis.patch.yml`。**
+原因：patch 里含 `config:` 行会让市场**无法热挂载**（`dshmarket/lib/hot.js:295`），
+只能重启生效；热配置文件则由本插件按 mtime 热读 ⇒ 改配置**不用重启** ✓。
+
+```jsonc
+{
+  "enabled": true,              // 总开关（任何类别都不动就设 false）
+  "shapeReasoning": true,       // 是否塑形推理这一类（旧名 dropReasoning 仍兼容）
+  "policy": {                   // 按类别各给一条 op 序列（文本 → 文本 的纯函数链）
+    "reasoning":     { "ops": [{ "op": "extract", "maxChars": 240 }] },
+    "toolResult":    { "ops": [{ "op": "keep" }] },
+    "toolArgs":      { "ops": [{ "op": "keep" }] },
+    "assistantText": { "ops": [{ "op": "keep" }] }
+  },
+  "cache": { "enabled": true, "path": "~/.dsh-entry-shaper.cache.jsonl", "maxBytes": 8388608 },
+  "proxy": { "enabled": true, "provider": "deepseek-shaped", "upstream": "deepseek-official" },
+  "opTimeoutMs": 8000,
+  "logPath": "~/.dsh-entry-shaper.log"
+}
 ```
 
-**可用 op**：`keep` · `drop` · `stub` · `extract` · `head` · `tail` · `truncate`（首尾保留 + 省略计数）
-· `python`（外部脚本，stdin/stdout JSON 或纯文本）· `summarize`（OpenAI 兼容 LLM，显式提示词，温度 0）。
+**打开代理只需改这里**（`proxy.enabled: true`），本插件会**惰性注册**该路由 —— 不必重挂载、
+不必重启 ✓。随后把会话或默认 provider 换成 `proxy.provider`（默认 `deepseek-shaped`）即生效。
 
-op 可任意链式组合，例如 `[{op: extract}, {op: truncate, maxChars: 80}]`；
-**op 可以是 async 的**（LLM / 外部进程），统一受 `opTimeoutMs`（默认 8s）约束：
-超时或抛错 ⇒ 只跳过该 op、保留上一步结果（fail-open）——最坏情况是"没省到"，绝不会挂住会话。
+### 免重启的三个开关
 
-```yaml
-# Python 接口：stdin 收 {"text":…,"kind":…}，stdout 回 {"text":…} 或纯文本
-reasoning: { ops: [{ op: python, script: "D:/shaper/my_shaper.py", protocol: json }] }
-# LLM 塑形：OpenAI 兼容 + 显式提示词；apiKey 取 op.apiKey → llm.apiKey → DEEPSEEK_API_KEY
-reasoning: { ops: [{ op: summarize, prompt: "压成 3 行要点，保留路径与数字。", maxTokens: 200 }] }
-```
+| 想做什么 | 怎么做 | 生效 |
+|---|---|---|
+| 全部停手（原样转发） | 建空文件 `~/.dsh-entry-shaper.OFF` | **立刻**，不用重启 |
+| 只停某一类 | 把该类别的 ops 改成 `[{ "op": "keep" }]` | 下一次请求 |
+| 完全卸载 | 市场里关掉插件（或从 `dsh.profile.bundles` 移除） | 立刻（热挂载） |
 
-### 非纯 op 的结果缓存（`summarize` / `python`）
+> ⚠️ **改配置会改变前缀形态** ⇒ 下一次请求整份按全价重算一次（约 $0.2）。
+> 所以请一次定好，别频繁来回调。
 
-纯 op（`extract`/`stub`/`truncate`…）是**纯函数** ⇒ 同一输入必然同一输出，前缀天然稳定 ✓。
-但 LLM / 外部脚本**不保证可复现**（temperature 0 也不保证：批处理、MoE 路由、服务端版本、并发都可能变）——
-同一条旧消息两次出网算出不同结果，**payload 前缀就会改变 ⇒ 付断点税**（一次几毛）。
+## 三种挂载方式
 
-所以非纯 op 的结果会被缓存，键 = `sha256(生效配置指纹 + op 参数 + 输入文本)`：
+| 方式 | 命令 / 操作 | 需要重启吗 | 说明 |
+|---|---|---|---|
+| profile bundle | `dsh plugin --profile web add "file:…"` 或手改 profile `package.json` | **需要** | 最稳，随 profile 长期加载 |
+| 市场热挂载 | 在市场插件页点开关 | **不需要** | 要求 patch 是**纯 insert**（本包已满足）；窗口期不影响已有会话 |
+| 直接 mount | 手工在一个 cordis 上下文里 `ctx.plugin(module)` | 不需要 | 用于实验 |
 
-```yaml
-        cache:
-          enabled: true                                  # 默认开
-          path: ~/.dsh-entry-shaper.cache.jsonl          # append-only JSONL，可直接查看
-          maxBytes: 8388608                              # 超过就轮转成 .1（旧缓存留一份）
-          maxEntryChars: 16384                           # 单条超过就不缓存
-```
+**热挂载的两条硬限制**（实测）：
+
+1. **不刷新模块缓存** —— 重挂载只新建实例，代码改动仍需重启；
+2. 热挂载条目的 id 是 `mkt-<原id>`，与 patch 层的 `- id: <原id>` **不是同一个条目**
+   ⇒ patch 层的 `disabled: true` 管不住热挂载实例。
+
+## 可用 op
+
+| op | 语义 |
+|---|---|
+| `keep` | 原样（默认） |
+| `drop` | 整块删除（**推理块例外**：内核会退回短桩，见下） |
+| `stub` | 换成 `stubTemplate`（默认 `[reasoning omitted: {chars} chars]`） |
+| `extract` | 只留决策句（`maxChars` 预算，默认 240） |
+| `head` / `tail` / `truncate` | 保留前 N / 后 N / 首尾 + 省略计数 |
+| `python` | 外部脚本：stdin 收 `{"text":…,"kind":…}`，stdout 回 `{"text":…}` 或纯文本 |
+| `summarize` | OpenAI 兼容 LLM（显式提示词、温度 0）；apiKey 取 `op.apiKey → llm.apiKey → DEEPSEEK_API_KEY` |
+
+op 可任意链式组合（`[{op: extract}, {op: truncate, maxChars: 80}]`），**可以是 async**，
+统一受 `opTimeoutMs`（默认 8s）约束：超时或抛错 ⇒ 只跳过该 op、保留上一步结果（fail-open）
+—— 最坏情况是"没省到"，绝不会挂住会话。
+
+### 非纯 op 必须缓存（前缀稳定性的前提）
+
+`python` / `summarize` **不保证可复现**（temperature 0 也不保证：批处理、MoE 路由、服务端版本、
+并发都可能变）。同一条旧消息两次出网算出不同结果 ⇒ **前缀改变 ⇒ 付断点税**。
+所以非纯 op 的结果按 `sha256(配置指纹 + op 参数 + 输入文本)` 缓存：
 
 | 性质 | 行为 |
 |---|---|
-| 改 prompt / model / 端点 | 键变化 ⇒ **自动失效** ✓（不会拿旧摘要冒充新配置） |
-| 重启 DSH | **仍命中** ✓（启动时把 JSONL 读进内存）⇒ 重启不打断前缀 ✓ |
-| 存了什么 | 只存**摘要**，不存原文 ✓；不想要就 `cache.enabled: false`（代价：每次出网都真调用） |
-| 磁盘 | 8 MB 上限 + 轮转；实测一条摘要几百字节 ⇒ 可忽略 ✓ |
+| 改 prompt / model / 端点 | 键变化 ⇒ 自动失效 ✓ |
+| 重启 DSH | 仍命中 ✓（启动时把 JSONL 读进内存）⇒ 重启不打断前缀 |
+| 存了什么 | 只存**摘要**，不存原文 ✓ |
 
-## 栈约束（为什么不会把前缀打崩）
+### 一条硬约束（踩过）
 
-会话是只进不出的栈，本插件**只处理刚追加的那一个元素**，并且有四道代码级护栏：
+**推理块永远不会被整块删除。** thinking 模式下，当报文以 `role:'tool'` 结果结尾时缺少
+`reasoning_content` 会被 API 拒绝：
+
+```
+400 The `reasoning_content` in the thinking mode must be passed back to the API.
+```
+
+换成短桩则 200 ⇒ API 要的是**字段在**，不是内容全。所以内核在链把它删空时会退回短桩
+（`test/shaping.test.mjs` 有对应用例）。
+
+## 栈护栏
 
 | # | 护栏 | 实现 |
 |---|---|---|
-| 1 | 只认原始追加事件 | `surfaceOp !== 'append'`（含本插件自己造的替换）一律跳过 |
-| 2 | 替换范围恰为自己 | `surfaceOp: { op: 'replace', start: seq, end: seq }` ⇒ **从不触碰更早的 seq** |
-| 3 | 元素若已不在当前表面（被别人替换/被压缩覆盖）⇒ 直接放弃 | `session.surface.nodes` 成员检查 |
-| 4 | 异步 op 超时即跳过 + 量"追加→定型"延迟 | `opTimeoutMs` 护栏；延迟超 `lagWarnMs` 写 `WARN` |
+| 1 | 只处理原始追加事件 | `surfaceOp !== 'append'` 一律跳过 |
+| 2 | 替换范围恰为自己 | `{ op: 'replace', start: seq, end: seq }` ⇒ 从不触碰更早的 seq |
+| 3 | 元素若已不在当前表面（被别人替换/被压缩覆盖）⇒ 放弃 | `session.surface.nodes` 成员检查 |
+| 4 | 异步 op 超时即跳过，并量"追加 → 定型"延迟 | `opTimeoutMs` + `lagWarnMs` |
 
-**护栏 4 是可观测证据**：日志首行 `strip #1 … lag=…ms` 记录定型延迟；只要它保持毫秒级，
-就说明"定型发生在首次发送之前"成立。若哪天出现 `WARN 定型延迟过大`，说明时序假设被破坏，
-应立即用 `~/.dsh-entry-shaper.OFF` 停手排查。
-
-> 反过来说：**本插件永远不会重写已发送的内容**（那是"出口压缩"的领域，要付断点税）。
-
-
-> 兼容旧配置：`reasoningMode: extract | stub | drop` 仍然可用，会被折算成 `policy.reasoning.ops`
-> （显式 `policy` 优先）。注意 **reasoning 永远不会被整块删除**——thinking 模式下缺字段会被 API
-> 拒绝（400），内核会把它退回短桩。
-
-**免重启熔断**：在用户主目录建一个空文件 `~/.dsh-entry-shaper.OFF` 即停手。
-
-验证：
-
-```powershell
-Get-Content "$env:USERPROFILE\.dsh-entry-shaper.log" -Tail 20
-# applied pid=… enabled=True …            ← 已生效
-# strip #1 seq=570 blocks=1 chars=624 provenance=553 项(首/末=17/570)
-```
+代理通道不依赖 1–4（它不碰会话），但继承"**确定性**"这一条：纯 op 天然确定，
+非纯 op 靠缓存兜住 ⇒ 同一输入永远同一形态。
 
 ## 实测数据
 
-全部为本机真实会话/真实 API 的实测，脚本在 `bench/`，可复现。
+全部为本机真实会话 / 真实 API 的实测。
 
-### 1. 规则（决定哪些算法可用）
+### 1. wire 级塑形：−40.1%，缓存命中 99.3%
 
-| 问题 | 结论 | 脚本 |
-|---|---|---|
-| 缺 `reasoning_content` 会被拒吗？ | 延续工具回路时**会**（400）；末尾有用户消息时不会 | `bench/passback-stub.mjs` |
-| 那换成短桩呢？ | **可以**（200）⇒ API 要求**字段在**，不要求内容全 | 同上（变体 I） |
-| 体积 | 3,500 字符 → 31 字符（**−99.1%**） | `test/` + 探针 |
+用 `dsh-llm-tap` 抓到的真实出网请求，把**外层**（`deepseek-shaped`，塑形前）与
+**内层**（`deepseek-official`，真正出网）按 `callId` 配对（`messageCount` 完全相同 ⇒ 同一次调用）：
 
-### 2. 行为分歧（真实历史，同一前缀发两次）
+| | 字符数 |
+|---|---|
+| 外层（塑形前） | 12,814,907 |
+| 内层（塑形后） | 7,678,485 |
+| **省** | **5,136,422（40.1%）**，逐对 39.6%–40.4% |
 
-来源：真实会话的"工具往返"快照，`full`（推理原样）vs 两种塑形；四档一致率（**同批 case 配对比较**）。
+同一会话的 `assistant/message.usage`：命中 **99.3%**（如 hit 191,872 / miss 1,270），
+且命中量每步按上一步新增量平稳递增 ⇒ **前缀在延长、没有被重建** ✓
 
-| 档位 | 纯桩 `stub` | **决策抽取 `extract`** |
-|---|---|---|
-| 动作类型（工具 vs 直接答复） | 12/17（71%） | **15/17（88%）** |
-| 同名工具 | 2/17（12%） | **6/17（35%）** |
-| 意图键 | 2/17（12%） | 6/17（35%） |
-| 完全一致 | 0/17 | 0/17 |
+**折成钱**：省下的是**命中价** token（$0.02/M）⇒ 按 193K token/步 估算约 **$0.0015/步**，
+300 步的长会话约 **$0.46**（≈3 元）。**不大，但是白拿的** —— 而且与轨迹长度成正比。
 
-**读法**：`extract`（只留"我打算/下一步/I'll"那类决策句）在每一档上都 ≥ `stub`，
-而体积只多花 1.8 个百分点（见下表）⇒ **`extract` 支配 `stub`**。
-注意 N=17 的配对样本不足以做强断言；且不同批次之间（会话在增长）数值不可直接比较。
+> 对照：一次断点付的是**整份 payload 全价**（$1/M）。所以"省 40% 的命中价"和"招来一次断点"
+> 完全不是一个量级 —— 这也是为什么**前缀单调**比"省得多"更重要。
 
-### 3. 固定轨迹重放（把成本从"模型行为漂移"里剥出来）
+### 2. 离线基准（可复现）
 
-真实会话里同一轮内**连续 12 次工具调用**当剧本，两臂逐轮发前缀请求，只有推理形态不同：
+固定轨迹重放：真实会话里同一轮内连续 12 次工具调用当剧本，两臂逐轮发前缀请求。
 
 | 轮次 | payload 字符（full → stub） | 省 |
 |---|---|---|
@@ -169,74 +234,83 @@ Get-Content "$env:USERPROFILE\.dsh-entry-shaper.log" -Tail 20
 | 8 | 76,720 → 36,938 | 51.9% |
 | **12** | **100,893 → 51,617** | **48.8%** |
 
-⇒ **末轮 payload 省 38~49%**（离线可复现，与缓存无关）。命令：`node bench/replay.mjs <session> --dry`
+命令：`node bench/replay.mjs <session.jsonl.zstd> --dry`
 
-**折成钱是多少**（解析换算：少发的都是**命中价** token）：
+### 3. 行为分歧（真实历史，同一前缀发两次）
 
-| 尺度 | 少发 token | 省（$0.02/M） |
+| 档位 | 纯桩 `stub` | **决策抽取 `extract`** |
 |---|---|---|
-| 单个长回合（12 轮工具调用，`stub`） | 90,444 | **$0.0018** |
-| 更长回合（40 轮窗口内，`stub` −38.0% / `extract` −36.2%） | 866,220 / 823,401 | **$0.0173 / $0.0165** |
-| 会话尺度（本机实测 3.95 亿命中 token 的会话 × 40%） | 158,000,000 | **≈ $3** |
+| 动作类型（工具 vs 直接答复） | 12/17（71%） | **15/17（88%）** |
+| 同名工具 | 2/17（12%） | **6/17（35%）** |
+| 完全一致 | 0/17 | 0/17 |
 
-⇒ **一个长回合只省一两美分**（省下的是最便宜的命中价 token），但**整段长会话能到几美元**。
-这也解释了它的价值命题：**与轨迹长度成正比**，短会话上可以忽略。
-
-> ⚠️ **在线成本 A/B 不可信**：先跑出过"−77%"，但反序重跑后另一臂得到**完全相同**的数字
-> ⇒ 那是"谁第二个跑谁几乎全命中"的**缓存复用假象**，已撤回。
-> 要账单口径的 ground truth，只能对比真实会话"插件开/关"两个阶段（`session-cost-audit.mjs`）。
+⇒ `extract` 每档都 ≥ `stub`，体积只多 1.8 个百分点 ⇒ **`extract` 支配 `stub`**（默认值）。
+N=17 的配对样本不足以做强断言。
 
 ### 4. agentic 基准（多轮工具调用 + 确定性判分）
 
-8 个短任务 + 3 个长轨迹任务（初始文件 + 提示 + 检查器），工具回路 `read_file` / `write_file` / `run_shell`：
+8 个短任务 + 3 个长轨迹任务（初始文件 + 提示 + 检查器）：
 
-| 臂 | 成功率 | 轮数 | 工具调用 | 输入 token | 成本 |
-|---|---|---|---|---|---|
-| `full`（短任务 8 个） | 8/8 | 35 | 36 | 31,580 | $0.0086 |
-| `stub`（短任务 8 个） | 8/8 | 37 | 44 | 33,322 | $0.0086 |
-| `full`（长轨迹 3 个） | 3/3 | 21 | 43 | 55,092 | $0.0096 |
-| `stub`（长轨迹 3 个） | 3/3 | 21 | 40 | 49,074 | $0.0117 |
+| 臂 | 成功率 | 轮数 | 输入 token |
+|---|---|---|---|
+| `full`（短任务 8 个） | 8/8 | 35 | 31,580 |
+| `stub`（短任务 8 个） | 8/8 | 37 | 33,322 |
+| `full`（长轨迹 3 个） | 3/3 | 21 | 55,092 |
+| `stub`（长轨迹 3 个） | 3/3 | 21 | 49,074 |
 
-**读法**：质量未观察到退化（短任务 8/8、长轨迹 3/3）；成本列**不可信**——两臂会跑出不同的
-命令与输出，未命中被"这轮干了什么"污染 ⇒ 成本请看上面的固定轨迹重放。
+**质量未观察到退化**；成本列**不可信**（两臂会跑出不同的命令与输出，未命中被"这轮干了什么"
+污染）⇒ 成本请看固定轨迹重放。
+
+> ⚠️ **在线成本 A/B 不可信**：曾跑出"−77%"，但反序重跑后另一臂得到**完全相同**的数字
+> ⇒ 那是"谁第二个跑谁几乎全命中"的缓存复用假象，**已撤回**。
 
 ## 现状与限制
 
-- **默认关闭**：行为分歧显示桩化会改变下一步动作（76% 同一"动作类型"，41% 同一工具），
-  质量代价需在长轨迹任务上确认；
-- **只处理 `reasoning`**：tool 结果（21.4%）与 tool 参数（40.2%）尚未塑形，
-  路线与风险序见 [`docs/PROCESSING.md`](docs/PROCESSING.md)；
-- **基准边界**：行为分歧测的是"是否被改变"，不是"是否更好"；agentic 基准目前任务偏短，
-  长轨迹任务（15~30 轮 + 大体量工具输出）正在补。
+- **默认关闭**：本包默认 `enabled: false`，需要你确认可接受"模型只看得到推理精要"这一点；
+- **推理是有损的**：`extract` 只留决策句（默认 240 字符预算），探索与试错过程不进 payload
+  ⇒ 模型可能在长轨迹上重复劳动。**界面与日志永远保留原文**，所以审计不受影响；
+  觉得太紧就换 `head`（保留真实开头）或放宽 `maxChars`（代价：省幅下降）；
+- **默认只塑形推理**：`toolResult` / `toolArgs` / `assistantText` 默认 `keep`。
+  官方 `tool-result-pruner` 已在做工具结果剪枝，先别重复造轮子；
+- **任务偏短**：agentic 基准的任务规模仍小于真实长会话，长轨迹任务（15–30 轮 + 大体量
+  工具输出）还在补；
+- **基准边界**：行为分歧测的是"是否被改变"，不是"是否更好"。
 
-## 两条硬约束（踩过，写下来）
+## 故障排查
 
-| 约束 | 出处 |
+| 现象 | 原因 / 处理 |
 |---|---|
-| 替换事件的 `sourceEventSeqs` 必须**原样沿用**原事件（每个 source 须是同 step 的 `assistant/chunk`、不重复、严格更早），否则**抛错** | `packages/llm/token-meter/src/index.ts:279-304` |
-| 替换事件**不复制** `usage`，否则同一步被计两次 | `packages/llm/token-meter/src/usage-projection.ts:82-84` |
+| 模型选择器里看不到代理 | 之前踩过：`listModels()` 未把 `provider` 改盖成本路由 id ⇒ 整组被判 `INVALID_CATALOG` 而不显示。已修（0.9.3）；自查：`POST /api/llm.models` 看 `failures` |
+| 日志有 `proxy 注册失败：adapter.xxx is not a function` | 适配器缺运行时要求的成员。运行时调用 `providerInfo` / `providerRetryPolicy` / `listModels` / `resolveModel` / `prepareCall` / `stream` **全部**（`packages/llm/llm/src/index.ts`）。已修（0.9.2） |
+| 热挂载后行为没变 | 热挂载**不刷新模块缓存** ⇒ 代码改动必须重启；只有配置与开关能热改 |
+| 看得到省了多少吗 | 日志里 `proxy-shape #n chars=A→B（累计 …）`（前 3 次 + 之后每 20 次一行） |
+| 想验证出网内容 | 装 `dsh-llm-tap` 看 `~/.dsh-llm-tap/llm-tap.jsonl`，或读本插件日志的字符统计 |
+| 突然行为异常 | 建 `~/.dsh-entry-shaper.OFF` 立停（原样转发），再排查 |
 
 ## 文档
 
 | 文档 | 内容 |
 |---|---|
-| [`docs/PIPELINE.md`](docs/PIPELINE.md) | 当前工作管道：总图、逐步时序（含 harness 源码出处）、元素生命周期、降级路径、验收观测点 |
-| [`docs/PROCESSING.md`](docs/PROCESSING.md) | 处理层规范：op 目录、`shaper` 槽位协议、LLM op 口径、里程碑 |
-| [`CHANGELOG.md`](CHANGELOG.md) | 变更记录（含 0.1.0 的 `drop` 被基准否掉的完整背景） |
+| [`docs/OFFICIAL-STACK.md`](docs/OFFICIAL-STACK.md) | 官方三层（pruner / compaction / command-compact）的位置与阈值、一次 `/compact` 的实测账单、本插件的空位 |
+| [`docs/PIPELINE.md`](docs/PIPELINE.md) | 工作管道：总图、时序（含 harness 源码出处）、元素生命周期、降级路径、验收观测点 |
+| [`docs/PROCESSING.md`](docs/PROCESSING.md) | 处理层规范：op 目录、协议、里程碑 |
+| [`CHANGELOG.md`](CHANGELOG.md) | 变更记录（含被基准否掉的方案与踩过的坑） |
 | [`SECURITY.md`](SECURITY.md) | 边界与失败模式 |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | 改动前必读 |
 
 ## 开发
 
 ```powershell
-node test/run-all.mjs                                          # 单测（17 例，无需 DSH 运行时）
-node bench/divergence.mjs "<session.jsonl.zstd>" --cases=20     # 行为分歧
-node bench/agentic/runner.mjs --max-rounds=20                   # agentic 基准（需真实 shell）
-node bench/passback-stub.mjs                                    # 规则边界探针
+node test/run-all.mjs                                          # 单测（61 例，无需 DSH 运行时）
+node test/shaping.test.mjs                                     # 同上（直接跑，沙箱友好）
+node bench/replay.mjs "<session.jsonl.zstd>" --dry             # 固定轨迹重放
+node bench/divergence.mjs "<session.jsonl.zstd>" --cases=20    # 行为分歧
+node bench/agentic/runner.mjs --max-rounds=20                  # agentic 基准（需真实 shell）
 ```
 
-> 基准与检查器需要能捕获子进程输出的真实 shell（受限沙箱会拦 Node 的管道 spawn）；
-> shell 可用 `DSH_BENCH_SHELL` 指定，默认自动探测。
+> `node --test test/` 在受限沙箱下会因 `spawn EPERM`（运行器要管道）失败 ——
+> 那是沙箱限制，不是测试问题；本地用 `node test/shaping.test.mjs`，CI 用 `node --test`。
+> 基准与检查器需要能捕获子进程输出的真实 shell；可用 `DSH_BENCH_SHELL` 指定。
 
 ## 许可
 

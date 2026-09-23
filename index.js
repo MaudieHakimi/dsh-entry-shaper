@@ -464,12 +464,37 @@ export async function shapeMessages(messages, policy, ctx = {}) {
  * @param opts - { llm, upstream, policy, ctx }
  * @returns LlmAdapter 形状的对象（仅 runtime 需要的成员）
  */
-export function createProxyAdapter({ llm, upstream, policy, getPolicy, ctx, shouldShape = () => true }) {
+export function createProxyAdapter({ llm, upstream, policy, getPolicy, ctx, shouldShape = () => true, onShaped }) {
   const policyNow = () => (typeof getPolicy === 'function' ? getPolicy() : (policy ?? {}))
+  /**
+   * 估算一次 messages 的字符量（只算文本/推理/参数，忽略结构开销）。
+   * 用途：给出**不依赖任何外部工具**的自证数字 —— 装了本插件就能在日志里看到省了多少，
+   * 不必去抓 wire 抓包（这也是本机实测 −40% 的同一个口径）。
+   */
+  const measure = (messages) => {
+    let chars = 0
+    for (const m of messages ?? []) {
+      for (const b of m?.content ?? []) {
+        if (typeof b === 'string') { chars += b.length; continue }
+        if (typeof b?.text === 'string') chars += b.text.length
+        else if (typeof b?.arguments === 'string') chars += b.arguments.length
+      }
+    }
+    return chars
+  }
   const proxyStream = async function* proxyStream(options) {
     // 急刹与总闸在这里也要生效：不塑形就**原样转发**（而不是拒绝请求），
     // 这样哨兵一建就立刻回到"没装插件"的行为，且不会打断任何正在进行的调用。
-    const messages = shouldShape() ? await shapeMessages(options?.messages, policyNow(), ctx) : options?.messages
+    let messages = options?.messages
+    if (shouldShape()) {
+      const before = measure(messages)
+      messages = await shapeMessages(messages, policyNow(), ctx)
+      const after = measure(messages)
+      // 只统计"塑形确实发生"的调用；before===after 时不必刷日志
+      if (after !== before) {
+        try { onShaped?.({ before, after }) } catch { /* 统计失败不影响请求 */ }
+      }
+    }
     const inner = llm.stream({ ...options, provider: upstream, messages })
     for await (const chunk of inner) yield chunk
   }
@@ -669,6 +694,23 @@ export function apply(ctx, config = {}) {
         getPolicy: resolvePolicy,   // 每次调用现算 ⇒ 配置热改立刻生效 ✓
         ctx: baseOpCtx,
         shouldShape,
+        /**
+         * 每次塑形都记一行（前 3 次 + 之后每 20 次），让"到底省了多少"**不依赖任何
+         * 外部抓包工具**就能看到：装了插件、看一眼日志即可验证。
+         * 日志只记字符数，不记内容 ✓。
+         */
+        onShaped({ before, after }) {
+          stats.proxyShaped = (stats.proxyShaped ?? 0) + 1
+          stats.proxyCharsBefore = (stats.proxyCharsBefore ?? 0) + before
+          stats.proxyCharsAfter = (stats.proxyCharsAfter ?? 0) + after
+          const n = stats.proxyShaped
+          if (n <= 3 || n % 20 === 0) {
+            const saved = stats.proxyCharsBefore - stats.proxyCharsAfter
+            log(`proxy-shape #${n} chars=${before}→${after}`
+              + `（本次 −${(100 * (before - after) / Math.max(1, before)).toFixed(1)}%；`
+              + `累计 ${stats.proxyCharsBefore}→${stats.proxyCharsAfter} = −${(100 * saved / Math.max(1, stats.proxyCharsBefore)).toFixed(1)}%）`)
+          }
+        },
       })
       llm.registerAdapter([alias], adapter)
       proxyRegistered = true

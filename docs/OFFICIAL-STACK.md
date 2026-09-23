@@ -22,7 +22,7 @@
 
 ## 2. 本机实测：一次 `/compact` 的真实账单
 
-会话 `session-acde5be7-…`（D:\DSH Desktop），2026-09-23，用户手动 `/compact`：
+会话 `session-acde5be7-…`（本机一个长会话），2026-09-23，用户手动 `/compact`：
 
 | 观测项 | 数值 | 来源 |
 |---|---|---|
