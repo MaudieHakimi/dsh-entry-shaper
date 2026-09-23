@@ -1,7 +1,16 @@
 # 工作管道（当前实际在跑的路径）
 
-> 本文描述**今天真实生效**的管道（`index.js` 的 `reasoning → drop` 一环），
-> 不是规划。规划中的 op（stub / keep-last-k / summarize:llm）见 `PROCESSING.md`。
+> ⚠️ **2026-09-23 重大修正**：`assistant/message` **无法**用 `surfaceOp: replace` 替换 ——
+> session 端要求 `sourceEventSeqs` 含被替换节点自身，token-meter 端要求每一项都是同 step 的
+> `assistant/chunk`，两者矛盾（现场报 `must include every shadowed surface node`）。
+> 因此**推理不再走表面替换**，改由 `llm/stream` 中间件在**进入会话之前**处理：
+> 攒起 reasoning chunk → 推理结束时只吐出一个经 op 链处理的 chunk。
+> 代价：推理不再进入会话，**界面/历史也看不到推理**。
+> 表面层只保留**合法**的那条：`tool/result` 的同类替换。
+>
+> 下面其余内容描述的是"表面层定型"的通用机制（对 `tool/result` 仍成立），推理路径以本条为准。
+
+> 本文描述**今天真实生效**的管道，不是规划；规划中的 op 见 `PROCESSING.md`。
 
 ---
 

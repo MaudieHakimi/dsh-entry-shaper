@@ -301,6 +301,68 @@ export function apply(ctx, config = {}) {
   }
 
   /**
+   * ── 推理的塑造走"流过滤"，不走表面替换 ──
+   *
+   * 原因（现场踩到，并有源码依据）：`assistant/message` **无法**用 surfaceOp replace 替换——
+   *   * session 端：`surface replace: sourceEventSeqs must include every shadowed surface node`
+   *     （⇒ 必须含被替换的节点自己）；
+   *   * token-meter 端：每一项都必须是同 step 的 `assistant/chunk`
+   *     （⇒ 不能含它自己；主仓库注释里早写着 "`[seq, ...chunkSeqs]` 仍被拒"）。
+   *   两条校验器互相矛盾 ⇒ 这条路是死的。
+   *
+   * 于是推理改在 `llm/stream` 中间件里处理（`dsh-llm-tap` 证明这条通道可用）：
+   * 把流里的 reasoning chunk **先攒起来**，在推理结束（遇到第一个非 reasoning chunk 或流结束）时
+   * **只吐出一个**经 op 链处理的 reasoning chunk ⇒ 推理**根本没进会话**，无需替换、无校验器冲突；
+   * 而 payload 里仍有 reasoning_content（字段必须在，否则工具回路会被 API 400）。
+   */
+  const reasoningOps = () => {
+    const policy = { ...DEFAULTS.policy, ...(cfg.policy ?? {}) }
+    if (config?.reasoningMode && !(config?.policy?.reasoning)) {
+      policy.reasoning = config.reasoningMode === 'stub' || config.reasoningMode === 'drop'
+        ? { ops: [{ op: 'stub' }] }   // 流过滤下 drop 也只能变桩（字段必须在）
+        : { ops: [{ op: 'extract', maxChars: cfg.extractMaxChars ?? 240 }] }
+    }
+    return policy.reasoning?.ops ?? []
+  }
+
+  const shapeReasoningStream = (options, next) => {
+    if (!cfg.enabled || !cfg.dropReasoning) return next(options)
+    const ops = reasoningOps()
+    const stream = next(options)
+    return (async function* shapedStream() {
+      let buffered = ''
+      let sawReasoning = false
+      const flush = async () => {
+        if (!sawReasoning) return null
+        const raw = buffered
+        buffered = ''
+        sawReasoning = false
+        let out = await applyOps(raw, ops, { ...baseOpCtx, kind: 'reasoning' })
+        if (out === null || out === '') out = cfg.stubTemplate.replace('{chars}', String(raw.length))
+        stats.streamShaped = (stats.streamShaped ?? 0) + 1
+        stats.streamChars = (stats.streamChars ?? 0) + raw.length
+        if (stats.streamShaped === 1 || stats.streamShaped % 25 === 0) {
+          log(`stream-shape #${stats.streamShaped} chars=${raw.length}→${out.length} ops=${ops.map((o) => o.op).join('→')}`)
+        }
+        return { type: 'reasoning', text: out }
+      }
+      for await (const chunk of stream) {
+        if (chunk?.type === 'reasoning') {
+          sawReasoning = true
+          buffered += typeof chunk.text === 'string' ? chunk.text : ''
+          continue
+        }
+        const flushed = await flush()
+        if (flushed) yield flushed
+        yield chunk
+      }
+      const tail = await flush()
+      if (tail) yield tail
+    })()
+  }
+  ctx.on('llm/stream', shapeReasoningStream)
+
+  /**
    * 栈护栏（为什么不会把前缀打崩）：
    *   1. 只处理 surfaceOp === 'append' 的**刚追加**事件，替换范围恰为它自己
    *      （start === end === event.seq）⇒ **从不触碰更早的 seq**；
@@ -394,6 +456,19 @@ export function apply(ctx, config = {}) {
       }
 
       if (event.type !== 'assistant/message') return
+
+      // ⛔ 已知不可用（默认关闭）：`assistant/message` 无法用 surfaceOp replace 替换 ——
+      // session 端要求 sourceEventSeqs 含被替换节点自身，token-meter 端要求每一项都是
+      // 同 step 的 assistant/chunk，两者矛盾（现场报 "must include every shadowed surface node"）。
+      // ⇒ 推理改由上面的 llm/stream 中间件处理。此处默认直接返回，不再做无谓尝试。
+      if (cfg.surfaceAssistant !== true) {
+        if (!stats.surfaceAssistantNoted) {
+          stats.surfaceAssistantNoted = true
+          log('assistant/message 不做表面替换（校验器冲突）⇒ 推理走 llm/stream 中间件；'
+            + '如需继续实验该路径可设 surfaceAssistant: true')
+        }
+        return
+      }
 
       const message = event.data?.message
       const content = message?.content

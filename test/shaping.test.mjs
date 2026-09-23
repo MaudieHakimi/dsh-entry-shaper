@@ -36,8 +36,37 @@ function setup(config = {}) {
       appends.push(args)
     },
   }
-  apply(ctx, { logPath, offSentinel: sentinel, ...config })
+  // 说明：assistant/message 的"表面替换"路径在真实 harness 上被证明**不可用**
+  // （session 端与 token-meter 端的 provenance 要求互相矛盾），因此默认关闭。
+  // 这里默认打开它，是为了继续覆盖那段代码；真实生效的路径是 llm/stream 中间件。
+  apply(ctx, { logPath, offSentinel: sentinel, surfaceAssistant: true, ...config })
   return { handlers, appends, session, logPath, sentinel, ctx }
+}
+
+/** 只订阅 llm/stream 的装配（用于流过滤测试）。 */
+function setupStream(config = {}) {
+  caseNo += 1
+  const logPath = join(TMP, `stream-${caseNo}.log`)
+  const sentinel = join(TMP, `stream-${caseNo}.OFF`)
+  rmSync(logPath, { force: true })
+  rmSync(sentinel, { force: true })
+  const listeners = []
+  const ctx = { on: (name, handler) => { listeners.push({ name, handler }); return () => {} } }
+  apply(ctx, { logPath, offSentinel: sentinel, ...config })
+  return {
+    streamListener: listeners.find((l) => l.name === 'llm/stream')?.handler,
+    listeners,
+    logPath,
+  }
+}
+
+/** 用一组 chunk 驱动流中间件并收集输出。 */
+async function runStream(streamListener, chunks, options = {}) {
+  const source = (async function* () { for (const c of chunks) yield c })()
+  const wrapped = streamListener(options, () => source)
+  const out = []
+  for await (const chunk of wrapped) out.push(chunk)
+  return out
 }
 
 /** 等 microtask 落地（插件在 queueMicrotask 里追加）。 */
@@ -72,11 +101,12 @@ const emit = (handlers, session, event) => {
   }
 }
 
-test('订阅：注册 session/event 且带 global 标记', () => {
+test('订阅：注册 session/event（global）与 llm/stream 两个入口', () => {
   const { handlers } = setup()
-  assert.equal(handlers.length, 1)
-  assert.equal(handlers[0].eventName, 'session/event')
-  assert.deepEqual(handlers[0].opts, { global: true })
+  const names = handlers.map((h) => h.eventName).sort()
+  assert.deepEqual(names, ['llm/stream', 'session/event'], '两个入口：表面事件 + 流中间件')
+  const sessionEvent = handlers.find((h) => h.eventName === 'session/event')
+  assert.deepEqual(sessionEvent.opts, { global: true })
 })
 
 test('决策抽取（默认）：reasoning 换成"抽取 + 省略计数"，text/tool-call 原样', async () => {
@@ -353,6 +383,67 @@ test('op 组合：全 keep 时不产生任何事件（不做无谓替换）', as
   })
   await settle()
   assert.equal(appends.length, 0)
+})
+
+// ── 推理的真实通道：llm/stream 中间件（表面替换那条路已知不可用）──
+
+test('流过滤：推理 chunk 被攒起、只吐出一个经 op 处理的 chunk', async () => {
+  const { streamListener } = setupStream()
+  const out = await runStream(streamListener, [
+    { type: 'reasoning', text: 'Exploring ' },
+    { type: 'reasoning', text: 'many options. ' },
+    { type: 'reasoning', text: 'I will patch a.txt now.' },
+    { type: 'text', text: 'answer' },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ])
+  assert.equal(out.length, 3, '还原成 3 个 chunk：reasoning + text + finish')
+  assert.equal(out[0].type, 'reasoning', '推理字段必须仍在（否则工具回路会 400）')
+  assert.ok(out[0].text.startsWith('[reasoning extract:'), '默认走 extract')
+  assert.equal(out[1].type, 'text')
+  assert.equal(out[2].type, 'finish')
+})
+
+test('流过滤：stub 模式把推理换成短桩', async () => {
+  const { streamListener } = setupStream({ policy: { reasoning: { ops: [{ op: 'stub' }] } } })
+  const out = await runStream(streamListener, [
+    { type: 'reasoning', text: 'x'.repeat(300) },
+    { type: 'text', text: 'done' },
+  ])
+  assert.equal(out[0].text, '[reasoning omitted: 300 chars]')
+  assert.equal(out[1].text, 'done')
+})
+
+test('流过滤：只在末尾有推理时也能吐出（流结束时 flush）', async () => {
+  const { streamListener } = setupStream({ policy: { reasoning: { ops: [{ op: 'stub' }] } } })
+  const out = await runStream(streamListener, [
+    { type: 'text', text: 'hi' },
+    { type: 'reasoning', text: 'y'.repeat(50) },
+  ])
+  assert.equal(out.length, 2)
+  assert.equal(out[0].type, 'text')
+  assert.equal(out[1].type, 'reasoning')
+  assert.equal(out[1].text, '[reasoning omitted: 50 chars]')
+})
+
+test('流过滤：无推理时不改变任何 chunk', async () => {
+  const { streamListener } = setupStream()
+  const chunks = [{ type: 'text', text: 'a' }, { type: 'finish', reason: { kind: 'stop' } }]
+  const out = await runStream(streamListener, chunks)
+  assert.deepEqual(out, chunks)
+})
+
+test('流过滤：enabled=false 时原样透传', async () => {
+  const { streamListener } = setupStream({ enabled: false })
+  const chunks = [{ type: 'reasoning', text: 'zzz' }, { type: 'text', text: 'a' }]
+  const out = await runStream(streamListener, chunks)
+  assert.deepEqual(out, chunks)
+})
+
+test('默认不尝试 assistant/message 的表面替换（已知校验器冲突）', async () => {
+  const { handlers, appends, session } = setup({ surfaceAssistant: false })
+  emit(handlers, session, makeEvent())
+  await settle()
+  assert.equal(appends.length, 0, '表面替换默认关闭')
 })
 
 test('非 assistant/message 事件被跳过', async () => {

@@ -1,6 +1,6 @@
 {
   "name": "dsh-entry-shaper",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "入口塑造（payload shaping）：在元素被首次发送之前定型，使 payload 前缀永远单调 ⇒ 零断点税。当前只做「摘掉 assistant 消息里的 reasoning 块」。",
   "type": "module",
   "main": "index.js",
