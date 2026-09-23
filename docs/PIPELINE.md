@@ -1,14 +1,23 @@
 # 工作管道（当前实际在跑的路径）
 
-> ⚠️ **2026-09-23 重大修正**：`assistant/message` **无法**用 `surfaceOp: replace` 替换 ——
-> session 端要求 `sourceEventSeqs` 含被替换节点自身，token-meter 端要求每一项都是同 step 的
-> `assistant/chunk`，两者矛盾（现场报 `must include every shadowed surface node`）。
-> 因此**推理不再走表面替换**，改由 `llm/stream` 中间件在**进入会话之前**处理：
-> 攒起 reasoning chunk → 推理结束时只吐出一个经 op 链处理的 chunk。
-> 代价：推理不再进入会话，**界面/历史也看不到推理**。
+> **2026-09-23 路线修正（按时间顺序）**
+>
+> ① `assistant/message` **无法**用 `surfaceOp: replace` 替换 —— session 端要求
+> `sourceEventSeqs` 含被替换节点自身，token-meter 端要求每一项都是同 step 的
+> `assistant/chunk`，两者矛盾（现场报 `must include every shadowed node`）
+> ⇒ **推理不再走表面替换**，改由 `llm/stream` 中间件在进入会话之前处理。
+>
+> ② 随后发现**更好的落点**：与其在"进入会话之前"改，不如在**出网之前**改 ——
+> 即注册一个代理 provider，把 `deriveMessages()` 的结果塑形后再交上游。
+> 这样**日志与界面连推理都不丢**（原文照常进会话），而只有发出去的那一份被塑形。
+> **这是现在推荐的默认路径**（`proxy.enabled: true`）。
+>
+> ⇒ **两条通道并存，且互斥不重复塑形**：代理开启时 `llm/stream` 过滤会**主动让路**
+> （`index.js` 里有对应的 `proxyBypassNoted` 逻辑），避免双重塑形与日志丢原文。
 > 表面层只保留**合法**的那条：`tool/result` 的同类替换。
 >
-> 下面其余内容描述的是"表面层定型"的通用机制（对 `tool/result` 仍成立），推理路径以本条为准。
+> 下面 §1 的总图描述的是**表面层定型**的通用机制（对 `tool/result` 与实验性的
+> `surfaceAssistant` 仍成立）；默认路径（代理 → wire）见 §7。
 
 > 本文描述**今天真实生效**的管道，不是规划；规划中的 op 见 `PROCESSING.md`。
 
@@ -83,28 +92,80 @@
 
 ## 4. 现在能塑形什么 / 还差什么
 
-| 类别 | 占追加内容（实测 453 步会话） | 现在 | 规划 |
+> ⚠️ **本表已按 0.9.x 实际能力重写**（旧版把 reasoning 记作 `✅ drop`、其余全 `❌ keep`）。
+> 现在**四个类别都由 op 链驱动**（`policy.reasoning / toolResult / toolArgs / assistantText`），
+> 下表的"默认"列指**出厂 DEFAULTS**，不是能力上限。
+
+| 类别 | 占追加内容（实测 453 步会话） | 默认 op | 可用但默认关 |
 |---|---|---|---|
-| reasoning | **34.8%** | ✅ `drop` | `keep-last-k`、`summarize:llm` |
-| tool 调用参数 | 40.2% | ❌ `keep` | `stub`（风险最高，最后做） |
-| tool 结果 | 21.4% | ❌ `keep` | `stub`（首尾桩） |
-| assistant 正文 | 1.8% | ❌ `keep` | 不建议动 |
-| 用户消息 | 1.8% | ❌ `keep` | 不动 |
+| reasoning | **34.8%** | ✅ `extract`（决策句，240 字符预算） | `stub` / `drop`→内核回退短桩 / `head` / `tail` / `truncate` / `summarize` / `python` |
+| tool 调用参数 | 40.2% | ⬜ `keep` | 全部 op（**风险最高**：参数改坏 ⇒ 工具执行错，不是"答复变差"） |
+| tool 结果 | 21.4% | ⬜ `keep` | 全部 op（官方 `tool-result-pruner` 已在做，注意别重复） |
+| assistant 正文 | 1.8% | ⬜ `keep` | 全部 op（不建议动） |
+| 用户消息 | — | 🚫 永不触碰 | 硬编码跳过（`shapeMessages` 对 `role==='user'` 直接放行） |
 
 ## 5. 失败与降级路径
 
 ```
 事件不合法/无 reasoning        → 直接 return（零副作用）
 session.append 抛错            → 捕获 → 写日志 FAILED → 表面保持原样（会话不受影响）
+统计/日志段抛错                → 同上（**注意**：它抛在 append 之后 ⇒ 替换已生效、
+                                  只有日志与统计被废掉，表面行为完全看不出来。
+                                  这正是 `stats.blocks += reasoning.length` 那个
+                                  ReferenceError 藏了很久的原因 —— 见 §6 与回归用例）
+某个 op 超时/抛错              → 只跳过该 op，保留上一步结果（fail-open）
 日志写不了                     → 静默忽略（不影响会话）
 哨兵 ~/.dsh-entry-shaper.OFF   → 每 64 个事件查一次 → 停手（免重启）
 patch 里 enabled: false        → 完全不订阅动作（需重启）
+代理通道：应塑形而未塑形        → 原样转发（不拒绝请求）⇒ 不会打断正在进行的调用
 ```
 
-## 6. 三个验收观测点
+## 6. 验收观测点
+
+**默认路径（代理通道）**：
 
 | 看什么 | 期望 | 判据 |
 |---|---|---|
-| `~/.dsh-entry-shaper.log` | `applied … enabled=True` + `strip #1 … provenance=N 项` | provenance 项数应等于该 step 的 chunk 数 |
-| 界面历史 | 推理**照常显示** | 这是"两份存"的直接验收 |
-| `tools/session-cost-audit.mjs` | 每步输入下降；**未命中不出现整份 payload 尖峰** | 有尖峰 ⇒ 时机错了（变成了"出口压缩"），要立刻停手 |
+| `~/.dsh-entry-shaper.log` | `proxy registered provider=… upstream=…` | 注册成功，否则看同行的失败原因 |
+| 同上 | `proxy-shape #n chars=A→B（累计 …）` | 出网字符确实下降（本机实测 −40.1%） |
+| 会话 usage | 命中率 99% 量级；**每步命中量按新增量平稳递增** | 有整份 payload 尖峰 ⇒ 前缀被打断，时机/确定性出错，立即停手 |
+| 界面历史 | 推理**照常显示全文** | 这是"两份存"的直接验收（塑形只作用于 wire） |
+
+**实验路径（`surfaceAssistant: true`，默认关闭）**：
+
+| 看什么 | 期望 | 判据 |
+|---|---|---|
+| `applied … enabled=true` | 已生效 | — |
+| `strip #1 seq=… blocks=… chars=… provenance=N 项(首/末=…) lag=…ms` | 成功定型一次 | provenance 项数应等于该 step 的 chunk 数；**这行缺失 = 该段统计被静默跳过**（踩过） |
+| `WARN 定型延迟过大 lag=…ms` | 正常情况**不该出现** | 出现即说明"定型早于首次发送"的时序假设被破坏 ⇒ 建哨兵停手排查 |
+| `~/.dsh-entry-shaper.OFF` | 建后下一次请求不再塑形（`chars=A→A`） | 急停有效 |
+
+## 7. 默认路径：代理 provider（wire 级塑形）
+
+```
+┌─ 会话日志 + 界面（append-only，永不变；推理/正文/工具结果全都在）───────────────┐
+└──────────────────────────────────────────────────────────────────────────────┘
+        │ agent loop: deriveMessages() → buildRequest() → ctx.llm.stream({provider,…})
+        ▼
+┌─ dsh-entry-shaper 代理路由（provider = proxy.provider，默认 deepseek-shaped）───┐
+│ ① shouldShape()：enabled && 无哨兵 && 至少一个类别有非 keep 的 op                │
+│ ② shapeMessages(messages, policy)：按**内容类别**跑 op 链                        │
+│      assistant.reasoning → policy.reasoning      tool-result  → policy.toolResult│
+│      assistant.text      → policy.assistantText  tool-call.args→ policy.toolArgs │
+│      role==='user'       → 永不触碰                                              │
+│ ③ 纯 op 天然确定；非纯 op（summarize/python）走 sha256(指纹+参数+输入) 缓存       │
+│ ④ onShaped({before,after}) → 日志 proxy-shape #n chars=A→B（自证省幅）          │
+└──────────────────────────────────────────────────────────────────────────────┘
+        │ 转调上游：llm.stream({ ...options, provider: proxy.upstream })
+        │  ⇒ 凭据由 llm 服务按上游 id 解析（本插件不接触任何 API key）
+        │  ⇒ 上游 id ≠ 本路由 id ⇒ 不会再命中本代理（无递归）
+        ▼
+   POST {baseURL}/chat/completions（**塑形后的 payload**）
+```
+
+**为什么这条是免费的**（§3 的结论在这里最强）：`shapeMessages` 是**逐消息纯函数**
+（非纯 op 靠内容哈希缓存兜住确定性）⇒ 同一条旧消息在**每一次**出网都是同一个形态
+⇒ 请求 n 与 n+1 的前缀逐字相同 ⇒ **全命中，零断点税**。
+
+本机实测：出网 −40.1%（13 对 `callId` 配对），命中率 99.3%，命中量按新增量平稳递增。
+取证：`dsh-llm-tap` 的 `~/.dsh-llm-tap/llm-tap.jsonl`，或本插件自己的 `proxy-shape` 日志。

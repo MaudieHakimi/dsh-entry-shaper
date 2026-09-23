@@ -4,7 +4,7 @@
 //      CI 里：node --test test/
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, rmSync, writeFileSync, existsSync } from 'node:fs'
+import { mkdirSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -452,6 +452,33 @@ test('默认不尝试 assistant/message 的表面替换（已知校验器冲突�
   emit(handlers, session, makeEvent())
   await settle()
   assert.equal(appends.length, 0, '表面替换默认关闭')
+})
+
+test('表面替换路径：成功日志与护栏 4 延迟告警真的执行（曾有 ReferenceError 把整段静默废掉）', async () => {
+  // 回归用例。曾经 `stats.blocks += reasoning.length` 引用了**未声明**的标识符，
+  // 而 `reasoning` 只是别处的局部变量 ⇒ 抛 ReferenceError。它抛在 try 内、且位置在
+  // `session.append` **之后**，所以表面替换照常成功、只有后面的语句全部不执行：
+  // 统计不记账、护栏 4 的 lagWarnMs 告警永不触发、`strip #1` 成功日志永不输出
+  //（而 docs/PIPELINE.md 正把 `strip #1` 列为验收观测点）。
+  // 61 个用例里没有一个读过日志文件 —— 这就是它当初溜过去的原因。
+  const { handlers, appends, session, logPath } = setup()
+  emit(handlers, session, makeEvent())
+  await settle()
+  assert.equal(appends.length, 1, '替换事件应当已产生')
+  const text = readFileSync(logPath, 'utf8')
+  assert.ok(text.includes('strip #1'), `成功日志缺失 ⇒ 该段又被静默跳过。实得日志：\n${text}`)
+  assert.ok(text.includes('blocks='), '成功日志应含 blocks= 计数')
+  assert.ok(!text.includes('FAILED append'), `不应出现失败行。实得日志：\n${text}`)
+})
+
+test('表面替换路径：lagWarnMs 设为 0 时护栏 4 的告警真的写出来', async () => {
+  // 护栏 4 的价值全在这行告警上：它是"定型早于首次发送"的可观测证据。
+  // 把阈值设成 0 ⇒ 任何非零延迟都触发（lag 为 null 时不触发，所以用带 time 的事件）。
+  const { handlers, session, logPath } = setup({ lagWarnMs: 0 })
+  emit(handlers, session, { ...makeEvent(), time: Date.now() - 50 })
+  await settle()
+  const text = readFileSync(logPath, 'utf8')
+  assert.ok(text.includes('WARN 定型延迟过大'), `护栏 4 告警未写出。实得日志：\n${text}`)
 })
 
 // ── 非纯 op 的结果缓存（保证多次出网结果逐字节一致 ⇒ 前缀稳定）──

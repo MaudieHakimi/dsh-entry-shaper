@@ -15,7 +15,7 @@
 # ~/.dsh-entry-shaper.config.json 示例：
 # {
 #   "enabled": true,
-#   "dropReasoning": true,
+#   "shapeReasoning": true,        ← 旧名 "dropReasoning" 仍被 mergeCfg() 兼容，但请用新名
 #   "policy": {
 #     "reasoning":  { "ops": [{ "op": "extract", "maxChars": 240 }] },
 #     "toolResult": { "ops": [{ "op": "keep" }] },
@@ -27,6 +27,7 @@
 #   "opTimeoutMs": 8000,
 #   "lagWarnMs": 2000
 # }
+# 全部可调键以 index.js 的 DEFAULTS 为准（配置文件按 mtime 热读）。
 #
 # 本插件不接管任何服务（不 provide），因此**不需要** disable 别的行 ✓。
 - insert:

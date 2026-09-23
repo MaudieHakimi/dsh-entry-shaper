@@ -152,6 +152,10 @@ const DEFAULTS = {
     upstream: 'deepseek-official',
   },
   stubTemplate: '[reasoning omitted: {chars} chars]',
+  // 单个 op 的超时预算（LLM / 外部进程）；超时只跳过该 op、保留上一步结果
+  opTimeoutMs: 8000,
+  // "事件追加 → 定型落地"的延迟阈值：超过就写 WARN（护栏 4 的可观测证据）
+  lagWarnMs: 2000,
   dropUsageOnReplace: true,
   logStats: true,
   // 可注入路径：默认写用户主目录；测试/嵌入时指向别处，避免污染
@@ -980,7 +984,14 @@ export function apply(ctx, config = {}) {
           })
 
           stats.stripped += 1
-          stats.blocks += reasoning.length
+          // ⚠️ 这里曾经写的是 `reasoning.length` —— 而 `reasoning` 在本作用域**从未声明**
+          //    （它只是上面循环里那个 `const reasoning = []` 收集数组，不在此作用域）。
+          //    后果不是"少记一个数"：`ReferenceError` 抛在 try 内 ⇒ 本块**其后全部**语句
+          //    都不执行 —— `chars`/`emptyFixed` 不记账、护栏 4 的 `lagWarnMs` 告警永不触发、
+          //    `strip #1`/`strip #N` 成功日志永不输出（而 `docs/PIPELINE.md` 正把 `strip #1`
+          //    列为验收观测点）。表面替换本身已经 append 成功，所以只有日志与统计被静默废掉。
+          //    `kept` 才是"塑形后保留的块数组"（见上面构建处与 nextData），故用它计数。
+          stats.blocks += kept.length
           stats.chars += chars
           if (emptyFixed) stats.emptyFixed += 1
 
@@ -996,13 +1007,13 @@ export function apply(ctx, config = {}) {
           if (stats.stripped === 1) {
             log(
               `strip #1 seq=${event.seq} turn=${event.data?.turn} step=${event.data?.step}`
-              + ` blocks=${reasoning.length} chars=${chars}${emptyFixed ? ' empty-fixed' : ''}`
+              + ` blocks=${kept.length} chars=${chars}${emptyFixed ? ' empty-fixed' : ''}`
               + ` provenance=${provenance.length} 项(首/末=${provenance[0]}/${provenance.at(-1)})`
               + ` lag=${lagMs ?? 'n/a'}ms`,
             )
           } else if (stats.stripped % 25 === 0) {
             log(
-              `strip #${stats.stripped} seq=${event.seq} blocks=${reasoning.length} chars=${chars}`
+              `strip #${stats.stripped} seq=${event.seq} blocks=${kept.length} chars=${chars}`
               + ` | 累计 blocks=${stats.blocks} chars=${stats.chars}`
               + ` (≈${Math.round(stats.chars * 0.27)} token) 运行 ${Math.round((Date.now() - started) / 1000)}s`,
             )
