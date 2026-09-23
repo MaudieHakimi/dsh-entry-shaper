@@ -138,6 +138,14 @@ const DEFAULTS = {
     maxBytes: 8 * 1024 * 1024,
     maxEntryChars: 16384,
   },
+  // ── 代理 provider（wire 级塑形；插件自足、不动 harness）──
+  // 打开后注册一个新 provider（默认 deepseek-shaped），其适配器把 messages 塑形后转调上游。
+  // 用法：在 settings.yaml 的 agent-default-model 里把 provider 换成它（或在模型选择器里选）。
+  proxy: {
+    enabled: false,
+    provider: 'deepseek-shaped',
+    upstream: 'deepseek-official',
+  },
   stubTemplate: '[reasoning omitted: {chars} chars]',
   dropUsageOnReplace: true,
   logStats: true,
@@ -374,6 +382,114 @@ export function extractReasoning(text, maxChars = 240) {
   return last.slice(-maxChars)
 }
 
+/**
+ * 逐消息塑形（wire 级的核心）：**只改"发出去的那一份"，不碰会话**。
+ *
+ * 与"表面替换"的区别：这里拿到的是 `deriveMessages()` 产出的消息数组（每次请求现算），
+ * 改完直接交给真适配器 ⇒ 日志/界面永远是原文 ✓；又因为塑形是**纯函数 + 缓存**，
+ * 同一条旧消息每次出网都是同一个形态 ⇒ 前缀稳定、零断点税 ✓。
+ *
+ * 类别映射：assistant 的 reasoning → policy.reasoning；assistant 的 text → policy.assistantText；
+ * tool-call 的 arguments → policy.toolArgs（默认 keep，改动有风险）；tool-result → policy.toolResult。
+ * user 消息永不触碰。
+ * @param messages - deriveMessages() 产出的消息数组
+ * @param policy - 按类别的 op 序列
+ * @param ctx - op 上下文（cache / llm / fetch / spawn / log …）
+ * @returns 塑形后的新数组（未变化的消息原样复用）
+ */
+export async function shapeMessages(messages, policy, ctx = {}) {
+  if (!Array.isArray(messages)) return messages
+  const out = []
+  for (const message of messages) {
+    const role = message?.role
+    if (role === 'user' && !Array.isArray(message?.content)) { out.push(message); continue }
+    if (!Array.isArray(message?.content)) { out.push(message); continue }
+    let changed = false
+    const content = []
+    for (const block of message.content) {
+      const type = block?.type
+      let kind = null
+      if (type === 'reasoning') kind = 'reasoning'
+      else if (type === 'text') kind = 'assistantText'
+      else if (type === 'tool-call') kind = 'toolArgs'
+      else if (type === 'tool-result') kind = 'toolResult'
+      if (kind === null) { content.push(block); continue }
+
+      const ops = policy[kind]?.ops ?? []
+      const pureKeep = ops.length === 0 || ops.every((o) => o?.op === 'keep' || o?.op === undefined)
+      if (pureKeep) { content.push(block); continue }
+
+      if (kind === 'toolResult') {
+        const parts = []
+        let partChanged = false
+        for (const part of block.content ?? []) {
+          if (typeof part?.text !== 'string') { parts.push(part); continue }
+          const after = await applyOps(part.text, ops, { ...ctx, kind })
+          if (after === null) { partChanged = true; continue }
+          if (after !== part.text) { partChanged = true; parts.push({ ...part, text: after }) } else parts.push(part)
+        }
+        if (partChanged) { changed = true; content.push({ ...block, content: parts }) } else content.push(block)
+        continue
+      }
+
+      const field = kind === 'toolArgs' ? 'arguments' : 'text'
+      const before = typeof block[field] === 'string' ? block[field] : ''
+      let after = await applyOps(before, ops, { ...ctx, kind })
+      if (kind === 'reasoning' && (after === null || after === '')) {
+        // 硬约束：reasoning 字段必须存在（否则延续工具回路会被 API 400）
+        after = (ctx.stubTemplate ?? '[reasoning omitted: {chars} chars]').replace('{chars}', String(before.length))
+      }
+      if (after === null) { changed = true; continue }
+      if (after !== before) { changed = true; content.push({ ...block, [field]: after }) } else content.push(block)
+    }
+    out.push(changed ? { ...message, content } : message)
+  }
+  return out
+}
+
+/**
+ * 代理 provider：注册一个新 provider id，其适配器把 messages 塑形后**转调上游 provider**。
+ *
+ * 为什么用代理而不是动 harness：插件自足、checkout 保持干净快照 ✓；转调用的是
+ * `llm.stream({…, provider: upstream})`（上游 id 不同 ⇒ 不会再命中本代理 ⇒ 无递归 ✓）。
+ *
+ * 只实现 `stream()`；`prepareCall()` 由我们自己给（基类默认只在 class 继承时才有 ✗），
+ * 并借用 `llm.resolveModelInfo(upstream, …)` 把**真实模型元数据**（contextWindow 等）带过来，
+ * 否则会丢掉模型信息 ✗。`listModels()` 照搬上游，方便在模型选择器里看到它。
+ * @param opts - { llm, upstream, policy, ctx }
+ * @returns LlmAdapter 形状的对象（仅 runtime 需要的成员）
+ */
+export function createProxyAdapter({ llm, upstream, policy, ctx }) {
+  const proxyStream = async function* proxyStream(options) {
+    const messages = await shapeMessages(options?.messages, policy, ctx)
+    const inner = llm.stream({ ...options, provider: upstream, messages })
+    for await (const chunk of inner) yield chunk
+  }
+  return {
+    async prepareCall(provider, model, signal) {
+      let info
+      try {
+        info = await llm.resolveModelInfo?.(upstream, model, signal)
+      } catch { /* 拿不到就用最小信息 */ }
+      return {
+        model: info ?? { provider, id: model, name: model },
+        stream: (options) => proxyStream(options),
+      }
+    },
+    stream: (options) => proxyStream(options),
+    async listModels() {
+      try {
+        return (await llm.listModels?.(upstream)) ?? []
+      } catch {
+        return []
+      }
+    },
+    providerInfo(provider) {
+      return { id: provider, name: `${provider} (entry-shaper 代理)` }
+    },
+  }
+}
+
 export function apply(ctx, config = {}) {
   const cfg = { ...DEFAULTS, ...(config ?? {}) }
   const LOG = cfg.logPath
@@ -407,6 +523,38 @@ export function apply(ctx, config = {}) {
     log,
   }
 
+  /** 策略解析（三条路径共用一处）：默认 policy + 用户 policy + legacy reasoningMode 折算。 */
+  const resolvePolicy = () => {
+    const policy = { ...DEFAULTS.policy, ...(cfg.policy ?? {}) }
+    // 判据必须用**用户传入的** config（合并后的 cfg.policy 永远含 reasoning，
+    // 会让 legacy reasoningMode 被静默忽略 —— 实测踩到过）
+    if (config?.reasoningMode && !(config?.policy?.reasoning)) {
+      policy.reasoning = config.reasoningMode === 'stub' || config.reasoningMode === 'drop'
+        ? { ops: [{ op: 'stub' }] }
+        : { ops: [{ op: 'extract', maxChars: cfg.extractMaxChars ?? 240 }] }
+    }
+    return policy
+  }
+
+  // ── 代理 provider：wire 级塑形（可选）──
+  if (cfg.proxy?.enabled) {
+    try {
+      const llm = typeof ctx.get === 'function' ? ctx.get('llm') : undefined
+      if (!llm || typeof llm.registerAdapter !== 'function') {
+        log('proxy 已配置但拿不到 llm 服务 ⇒ 跳过（fail-open）')
+      } else {
+        const alias = cfg.proxy.provider ?? 'deepseek-shaped'
+        const upstream = cfg.proxy.upstream ?? 'deepseek-official'
+        const adapter = createProxyAdapter({ llm, upstream, policy: resolvePolicy(), ctx: baseOpCtx })
+        llm.registerAdapter([alias], adapter)
+        log(`proxy registered provider=${alias} upstream=${upstream}`
+          + '（把 agent-default-model.provider 换成它即生效；日志与界面仍保留原文）')
+      }
+    } catch (error) {
+      log(`proxy 注册失败（fail-open）：${error?.message ?? error}`)
+    }
+  }
+
   /**
    * ── 推理的塑造走"流过滤"，不走表面替换 ──
    *
@@ -422,18 +570,19 @@ export function apply(ctx, config = {}) {
    * **只吐出一个**经 op 链处理的 reasoning chunk ⇒ 推理**根本没进会话**，无需替换、无校验器冲突；
    * 而 payload 里仍有 reasoning_content（字段必须在，否则工具回路会被 API 400）。
    */
-  const reasoningOps = () => {
-    const policy = { ...DEFAULTS.policy, ...(cfg.policy ?? {}) }
-    if (config?.reasoningMode && !(config?.policy?.reasoning)) {
-      policy.reasoning = config.reasoningMode === 'stub' || config.reasoningMode === 'drop'
-        ? { ops: [{ op: 'stub' }] }   // 流过滤下 drop 也只能变桩（字段必须在）
-        : { ops: [{ op: 'extract', maxChars: cfg.extractMaxChars ?? 240 }] }
-    }
-    return policy.reasoning?.ops ?? []
-  }
+  const reasoningOps = () => resolvePolicy().reasoning?.ops ?? []
 
   const shapeReasoningStream = (options, next) => {
     if (!cfg.enabled || !cfg.dropReasoning) return next(options)
+    // 代理 provider 已启用时**必须**让流原样通过：否则内层转调（provider=upstream）会再次
+    // 经过本中间件，推理就会被"在出生时"滤掉 ⇒ 日志又丢原文，代理的意义全没了。
+    if (cfg.proxy?.enabled) {
+      if (!stats.proxyBypassNoted) {
+        stats.proxyBypassNoted = true
+        log('proxy 已启用 ⇒ 推理改由 wire 层塑形，流过滤让路（避免双重塑形与日志丢原文）')
+      }
+      return next(options)
+    }
     const ops = reasoningOps()
     const stream = next(options)
     return (async function* shapedStream() {
@@ -509,17 +658,7 @@ export function apply(ctx, config = {}) {
         return
       }
 
-      const policy = { ...DEFAULTS.policy, ...(cfg.policy ?? {}) }
-      // 兼容旧配置：reasoningMode → policy.reasoning.ops。
-      // 注意判据必须用**用户传入的 config**（不能用合并后的 cfg.policy —— 默认 policy 里
-      // 永远有 reasoning，那样 legacy 的 reasoningMode 会被静默忽略，实测踩到过）。
-      if (config?.reasoningMode && !(config?.policy?.reasoning)) {
-        policy.reasoning = config.reasoningMode === 'drop'
-          ? { ops: [{ op: 'drop' }] }
-          : config.reasoningMode === 'stub'
-            ? { ops: [{ op: 'stub' }] }
-            : { ops: [{ op: 'extract', maxChars: cfg.extractMaxChars ?? 240 }] }
-      }
+      const policy = resolvePolicy()
 
       // ── 类别：tool 结果（与 assistant 消息走同一条 op 链，只是目标字段不同）──
       if (event.type === 'tool/result') {

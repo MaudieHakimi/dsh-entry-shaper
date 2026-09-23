@@ -8,7 +8,7 @@ import { mkdirSync, rmSync, writeFileSync, existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { apply, applyOps, createOpCache, extractReasoning } from '../index.js'
+import { apply, applyOps, createOpCache, createProxyAdapter, extractReasoning, shapeMessages } from '../index.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const TMP = join(HERE, '.tmp')
@@ -539,6 +539,123 @@ test('缓存：坏行被忽略，不影响会话', async () => {
   writeFileSync(cachePath, 'not json at all\n{"k":"abc"}\n', 'utf8')
   const cache = createOpCache({ cache: { path: cachePath, enabled: true } }, () => {})
   assert.equal(cache.get('abc'), undefined, '坏行/不完整记录直接忽略')
+})
+
+// ── wire 级：逐消息塑形 + 代理 provider ──
+
+const assistantMsg = () => ({
+  role: 'assistant',
+  content: [
+    { type: 'reasoning', text: `${'Exploring options. '.repeat(20)}I will patch a.txt now.` },
+    { type: 'text', text: 'answer' },
+    { type: 'tool-call', id: 'c1', name: 'read_file', arguments: '{"path":"a.txt"}' },
+  ],
+})
+const toolMsg = () => ({ role: 'user', content: [{ type: 'tool-result', toolCallId: 'c1', content: [{ type: 'text', text: 'X'.repeat(300) }] }] })
+const userMsg = () => ({ role: 'user', content: [{ type: 'text', text: '原始提问，不能改' }] })
+
+test('shapeMessages：默认只塑形 reasoning，text/tool-call/tool-result/user 原样', async () => {
+  const policy = { reasoning: { ops: [{ op: 'extract', maxChars: 60 }] }, toolResult: { ops: [{ op: 'keep' }] }, toolArgs: { ops: [{ op: 'keep' }] }, assistantText: { ops: [{ op: 'keep' }] } }
+  const out = await shapeMessages([assistantMsg(), toolMsg(), userMsg()], policy, {})
+  const assistant = out[0].content
+  assert.ok(assistant[0].text.startsWith('[reasoning extract:'), 'reasoning 被塑形')
+  assert.equal(assistant[1].text, 'answer', 'text 原样')
+  assert.equal(assistant[2].arguments, '{"path":"a.txt"}', 'tool-call 参数原样')
+  assert.equal(out[1].content[0].content[0].text.length, 300, 'tool-result 原样')
+  assert.equal(out[2].content[0].text, '原始提问，不能改', 'user 消息绝不触碰')
+  assert.notEqual(out[0], assistantMsg(), '被改动的消息是新对象')
+  assert.equal(out[2], out[2], '未改动的消息可复用')
+})
+
+test('shapeMessages：配置了 toolResult 时才对工具结果动手', async () => {
+  const policy = { reasoning: { ops: [{ op: 'keep' }] }, toolResult: { ops: [{ op: 'truncate', maxChars: 60 }] }, toolArgs: { ops: [{ op: 'keep' }] }, assistantText: { ops: [{ op: 'keep' }] } }
+  const out = await shapeMessages([assistantMsg(), toolMsg()], policy, {})
+  assert.equal(out[0].content[0].text.includes('省略'), false, 'reasoning 不该被改')
+  assert.ok(out[1].content[0].content[0].text.includes('省略'), 'tool-result 被截断')
+})
+
+test('shapeMessages：非纯 op 走缓存（两次塑形只调用一次 LLM）', async () => {
+  caseNo += 1
+  const cachePath = join(TMP, `cache-${caseNo}.jsonl`)
+  rmSync(cachePath, { force: true })
+  let calls = 0
+  const fetchMock = async () => {
+    calls += 1
+    return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: '要点' } }] }) }
+  }
+  const ctx = { fetch: fetchMock, llm: { apiKey: 'k' }, cache: createOpCache({ cache: { path: cachePath, enabled: true } }, () => {}) }
+  const policy = { reasoning: { ops: [{ op: 'summarize' }] }, toolResult: { ops: [{ op: 'keep' }] }, toolArgs: { ops: [{ op: 'keep' }] }, assistantText: { ops: [{ op: 'keep' }] } }
+  const a = await shapeMessages([assistantMsg()], policy, ctx)
+  const b = await shapeMessages([assistantMsg()], policy, ctx)
+  assert.equal(a[0].content[0].text, '要点')
+  assert.deepEqual(a, b, '两次塑形结果必须一致（前缀稳定）')
+  assert.equal(calls, 1, '第二次命中缓存')
+})
+
+function fakeLlm() {
+  const captured = []
+  return {
+    captured,
+    stream(options) {
+      captured.push(options)
+      return (async function* chunks() {
+        yield { type: 'text', text: `via:${options.provider}` }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      })()
+    },
+    async resolveModelInfo(provider, model) {
+      return { provider, id: model, name: 'Upstream Name', contextWindow: 1000000 }
+    },
+    async listModels() {
+      return [{ id: 'deepseek-flash', name: 'v4.1-flash' }]
+    },
+    registerAdapter(providers, adapter) {
+      this.registered = { providers, adapter }
+    },
+  }
+}
+
+test('代理适配器：prepareCall 带上游真实模型元数据（含 contextWindow）', async () => {
+  const llm = fakeLlm()
+  const adapter = createProxyAdapter({ llm, upstream: 'deepseek-official', policy: {}, ctx: {} })
+  const prepared = await adapter.prepareCall('deepseek-shaped', 'deepseek-flash')
+  assert.equal(prepared.model.contextWindow, 1000000, '必须借用上游元数据，否则丢掉窗口信息')
+  assert.equal(typeof prepared.stream, 'function')
+})
+
+test('代理适配器：转发时换成上游 provider，并把 messages 塑形', async () => {
+  const llm = fakeLlm()
+  const policy = { reasoning: { ops: [{ op: 'stub' }] }, toolResult: { ops: [{ op: 'keep' }] }, toolArgs: { ops: [{ op: 'keep' }] }, assistantText: { ops: [{ op: 'keep' }] } }
+  const adapter = createProxyAdapter({ llm, upstream: 'deepseek-official', policy, ctx: { stubTemplate: '[omitted {chars}]' } })
+  const chunks = []
+  for await (const c of adapter.stream({ provider: 'deepseek-shaped', model: 'deepseek-flash', messages: [assistantMsg()] })) chunks.push(c)
+
+  assert.equal(llm.captured.length, 1, '只应转发一次（不递归）')
+  const forwarded = llm.captured[0]
+  assert.equal(forwarded.provider, 'deepseek-official', '内层必须是上游 provider')
+  assert.ok(forwarded.messages[0].content[0].text.startsWith('[omitted '), '内层 messages 已塑形')
+  assert.equal(chunks[0].text, 'via:deepseek-official', '上游 chunk 原样透传')
+})
+
+test('代理适配器：listModels 照搬上游', async () => {
+  const llm = fakeLlm()
+  const adapter = createProxyAdapter({ llm, upstream: 'deepseek-official', policy: {}, ctx: {} })
+  assert.deepEqual(await adapter.listModels('deepseek-shaped'), [{ id: 'deepseek-flash', name: 'v4.1-flash' }])
+})
+
+test('插件启动：proxy.enabled 时注册代理 provider；拿不到 llm 服务则 fail-open', () => {
+  const registered = []
+  const ctx = {
+    on: () => () => {},
+    get: (name) => (name === 'llm' ? { registerAdapter: (p, a) => registered.push({ p, a }) } : undefined),
+  }
+  apply(ctx, { logPath: join(TMP, `proxy-${caseNo += 1}.log`), offSentinel: join(TMP, 'no.OFF'), proxy: { enabled: true, provider: 'shaped-x', upstream: 'deepseek-official' } })
+  assert.equal(registered.length, 1, '应注册一个代理 provider')
+  assert.deepEqual(registered[0].p, ['shaped-x'])
+  assert.equal(typeof registered[0].a.stream, 'function')
+
+  const noLlmCtx = { on: () => () => {}, get: () => undefined }
+  assert.doesNotThrow(() => apply(noLlmCtx, { logPath: join(TMP, 'proxy-nollm.log'), offSentinel: join(TMP, 'no.OFF'), proxy: { enabled: true } }))
 })
 
 test('非 assistant/message 事件被跳过', async () => {

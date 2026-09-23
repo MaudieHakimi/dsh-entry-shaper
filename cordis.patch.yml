@@ -43,6 +43,29 @@
 
         # op 超时护栏：LLM / 外部进程超过它就跳过，绝不挂住会话
         opTimeoutMs: 8000
+
+        # 非纯 op（summarize / python）的结果缓存：保证同一输入在多次出网之间结果一致
+        # （否则重算一变 ⇒ payload 前缀改变 ⇒ 断点税）。纯 op 不进缓存。
+        cache:
+          enabled: true
+          path: ~/.dsh-entry-shaper.cache.jsonl
+          maxBytes: 8388608
+          maxEntryChars: 16384
+
+        # ── wire 级塑形：代理 provider（插件自足，不动 harness）──
+        # 打开后本插件注册一个新 provider，它的适配器把 messages 塑形后**转调上游**：
+        #   * 会话 / 日志 / 界面**完整保留原文** ✓（不再像流过滤那样在"出生时"就替换）
+        #   * 只有"发出去的 payload"是抽取/桩 ⇒ 前缀稳定、零断点税 ✓
+        # 用法（两步）：
+        #   ① 这里改成 enabled: true
+        #   ② 在 ~/.dsh/settings.yaml 里把 agent-default-model.provider 改成 deepseek-shaped
+        #      （model id 不用改；想还原就改回 deepseek-official）
+        # 注意：proxy 开启时流过滤会自动让路（否则内层转调会再被滤一次 ⇒ 日志又丢原文）
+        proxy:
+          enabled: false
+          provider: deepseek-shaped
+          upstream: deepseek-official
+
         # 定型延迟告警阈值：从"事件追加"到"替换落地"的耗时超过它就写 WARN
         # （这是"定型早于首次发送"的可观测证据；一旦告警说明时序假设可能被破坏）
         lagWarnMs: 2000
