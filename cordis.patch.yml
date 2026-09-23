@@ -5,18 +5,49 @@
     - id: dsh-entry-shaper
       name: dsh-entry-shaper
       config:
-        # ⛔ 紧急关闭（2026-09-23）：行为分歧基准发现，在 thinking 模式下用**真实多轮历史**
-        # 发请求时，缺 reasoning_content 会被 API 拒绝：
-        #   "The `reasoning_content` in the thinking mode must be passed back to the API."
-        # 单轮探针（1 轮工具往返）曾返回 200，属于特例，不能代表真实会话。
-        # 规则边界正在用 bench/passback-rule.mjs 定位；在定论之前不要打开。
+        # 总开关。**注意**：profile 用户层（profiles/<name>/cordis.patch.yml）里若还有
+        #   - id: dsh-entry-shaper
+        #     disabled: true
+        # 那一行会覆盖这里（用户层最后应用）—— 两处都开才生效。
         enabled: true
-        # 当前唯一实现的塑形动作：处理 assistant/message 里的 reasoning 块
+        # 是否处理 reasoning（总闸）
         dropReasoning: true
-        # extract（默认，决策抽取：只留"我打算/下一步"那类句子）| stub（短桩）| drop（会被 400）
-        reasoningMode: extract
-        extractMaxChars: 240
-        # 替换事件不带 usage（meter 按事件折算 usage，复制会翻倍）。
+
+        # ── 处理层：按内容类别各给一条 op 序列（文本 → 文本 的纯函数链，可异步）──
+        # 可用 op：keep | drop | stub | extract | head | tail | truncate | python | summarize
+        #   * reasoning **永远不会被整块删除**：drop 对它无效，内核会退回短桩
+        #     （thinking 模式下"延续工具回路"时缺 reasoning_content 会被 API 400）。
+        #   * 未知 op 跳过；任何 op 抛错/超时都只跳过它自己（fail-open）。
+        policy:
+          reasoning:      { ops: [{ op: extract, maxChars: 240 }] }
+          toolResult:     { ops: [{ op: keep }] }
+          toolArgs:       { ops: [{ op: keep }] }
+          assistantText:  { ops: [{ op: keep }] }
+
+          # 想开"工具结果首尾桩"就这样写：
+          # toolResult:   { ops: [{ op: truncate, maxChars: 1024 }] }
+
+          # Python 接口：stdin 收一行 JSON {"text":...,"kind":...}，
+          # stdout 回 {"text":...} 或纯文本；退出码非 0 / 超时 / 空输出 ⇒ 跳过该 op。
+          # reasoning:    { ops: [{ op: python, script: "D:/shaper/my_shaper.py", protocol: json }] }
+
+          # LLM 塑形：OpenAI 兼容 POST {baseURL}/chat/completions，显式提示词，温度 0，
+          # 出网前可过 redact；失败/超时/空返回 ⇒ 跳过该 op。
+          # reasoning:    { ops: [{ op: summarize, prompt: "压成 3 行要点，保留路径与数字。", maxTokens: 200 }] }
+
+        # summarize op 的端点与模型（apiKey 依次取 op.apiKey → llm.apiKey → DEEPSEEK_API_KEY）
+        # llm:
+        #   baseURL: https://api.deepseek.com
+        #   model: deepseek-flash
+        #   apiKey: sk-…
+
+        # op 超时护栏：LLM / 外部进程超过它就跳过，绝不挂住会话
+        opTimeoutMs: 8000
+        # 定型延迟告警阈值：从"事件追加"到"替换落地"的耗时超过它就写 WARN
+        # （这是"定型早于首次发送"的可观测证据；一旦告警说明时序假设可能被破坏）
+        lagWarnMs: 2000
+
+        # 替换事件不带 usage（token-meter 按事件折算 usage，复制会双计）。
         # 若实测发现统计丢失（说明它按表面折算），改为 false。
         dropUsageOnReplace: true
         # 统计与自证写 ~/.dsh-entry-shaper.log

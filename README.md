@@ -62,9 +62,37 @@ dsh plugin --profile web add "file:D:\DSH Desktop\dsh-entry-shaper"
         dropUsageOnReplace: true   # 替换事件不带 usage（否则 token 统计双计）
 ```
 
-**可用 op**：`keep` · `drop` · `stub` · `extract` · `head` · `tail` · `truncate`（首尾保留 + 省略计数）。
+**可用 op**：`keep` · `drop` · `stub` · `extract` · `head` · `tail` · `truncate`（首尾保留 + 省略计数）
+· `python`（外部脚本，stdin/stdout JSON 或纯文本）· `summarize`（OpenAI 兼容 LLM，显式提示词，温度 0）。
+
 op 可任意链式组合，例如 `[{op: extract}, {op: truncate, maxChars: 80}]`；
-未知 op 会被跳过（fail-open）。
+**op 可以是 async 的**（LLM / 外部进程），统一受 `opTimeoutMs`（默认 8s）约束：
+超时或抛错 ⇒ 只跳过该 op、保留上一步结果（fail-open）——最坏情况是"没省到"，绝不会挂住会话。
+
+```yaml
+# Python 接口：stdin 收 {"text":…,"kind":…}，stdout 回 {"text":…} 或纯文本
+reasoning: { ops: [{ op: python, script: "D:/shaper/my_shaper.py", protocol: json }] }
+# LLM 塑形：OpenAI 兼容 + 显式提示词；apiKey 取 op.apiKey → llm.apiKey → DEEPSEEK_API_KEY
+reasoning: { ops: [{ op: summarize, prompt: "压成 3 行要点，保留路径与数字。", maxTokens: 200 }] }
+```
+
+## 栈约束（为什么不会把前缀打崩）
+
+会话是只进不出的栈，本插件**只处理刚追加的那一个元素**，并且有四道代码级护栏：
+
+| # | 护栏 | 实现 |
+|---|---|---|
+| 1 | 只认原始追加事件 | `surfaceOp !== 'append'`（含本插件自己造的替换）一律跳过 |
+| 2 | 替换范围恰为自己 | `surfaceOp: { op: 'replace', start: seq, end: seq }` ⇒ **从不触碰更早的 seq** |
+| 3 | 元素若已不在当前表面（被别人替换/被压缩覆盖）⇒ 直接放弃 | `session.surface.nodes` 成员检查 |
+| 4 | 异步 op 超时即跳过 + 量"追加→定型"延迟 | `opTimeoutMs` 护栏；延迟超 `lagWarnMs` 写 `WARN` |
+
+**护栏 4 是可观测证据**：日志首行 `strip #1 … lag=…ms` 记录定型延迟；只要它保持毫秒级，
+就说明"定型发生在首次发送之前"成立。若哪天出现 `WARN 定型延迟过大`，说明时序假设被破坏，
+应立即用 `~/.dsh-entry-shaper.OFF` 停手排查。
+
+> 反过来说：**本插件永远不会重写已发送的内容**（那是"出口压缩"的领域，要付断点税）。
+
 
 > 兼容旧配置：`reasoningMode: extract | stub | drop` 仍然可用，会被折算成 `policy.reasoning.ops`
 > （显式 `policy` 优先）。注意 **reasoning 永远不会被整块删除**——thinking 模式下缺字段会被 API

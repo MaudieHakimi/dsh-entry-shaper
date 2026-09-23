@@ -223,11 +223,87 @@ test('无 reasoning 的消息被跳过', async () => {
 
 // ── 处理层：op 组合 ──
 
-test('链式 op：extract → truncate 依次生效', () => {
+test('链式 op：extract → truncate 依次生效', async () => {
   const text = `${'Exploring many options. '.repeat(20)}I will patch parse.js now.`
-  const out = applyOps(text, [{ op: 'extract', maxChars: 500 }, { op: 'truncate', maxChars: 60 }])
+  const out = await applyOps(text, [{ op: 'extract', maxChars: 500 }, { op: 'truncate', maxChars: 60 }])
   assert.ok(out.length <= 90, `链后应被截断（实得 ${out.length}）`)
   assert.ok(out.includes('省略'), 'truncate 留下省略标记')
+})
+
+// ── 异步 op：LLM 调用 / Python 接口（都用注入的 mock，不真的出网或起进程）──
+
+test('summarize op：OpenAI 兼容请求 + 显式提示词（mock fetch）', async () => {
+  let seen = null
+  const fetchMock = async (url, init) => {
+    seen = { url, body: JSON.parse(init.body), auth: init.headers.authorization }
+    return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: '要点三行' } }] }) }
+  }
+  const out = await applyOps('很长很长的一段工具输出', [{ op: 'summarize', model: 'm', maxTokens: 64, prompt: '压成三点' }], {
+    fetch: fetchMock, llm: { baseURL: 'https://api.example.com/', apiKey: 'sk-test' },
+  })
+  assert.equal(out, '要点三行')
+  assert.equal(seen.url, 'https://api.example.com/chat/completions', '应走 OpenAI 兼容路径且去掉尾斜杠')
+  assert.equal(seen.body.model, 'm')
+  assert.equal(seen.body.temperature, 0)
+  assert.equal(seen.body.messages[0].content, '压成三点', '显式提示词')
+  assert.equal(seen.auth, 'Bearer sk-test')
+})
+
+test('summarize op：出网前过 redact（mock fetch）', async () => {
+  let sent = null
+  const fetchMock = async (_url, init) => {
+    sent = JSON.parse(init.body).messages[1].content
+    return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: 'ok' } }] }) }
+  }
+  await applyOps('token=sk-abcdefghijklmnop', [{ op: 'summarize' }], {
+    fetch: fetchMock, llm: { apiKey: 'k' }, redact: (t) => t.replace(/sk-[a-z]+/u, '[REDACTED]'),
+  })
+  assert.ok(!sent.includes('sk-abcdefghijklmnop'), '出网文本应已脱敏')
+})
+
+test('summarize op：HTTP 失败 ⇒ 该 op 跳过（保留上一步结果，fail-open）', async () => {
+  const fetchMock = async () => ({ ok: false, status: 500, json: async () => ({}) })
+  const out = await applyOps('原文', [{ op: 'stub' }, { op: 'summarize' }], { fetch: fetchMock, llm: { apiKey: 'k' } })
+  assert.equal(out, '[reasoning omitted: 2 chars]', 'LLM 失败后应保留 stub 的结果')
+})
+
+test('op 超时护栏：慢 op 被跳过', async () => {
+  const slowOp = { op: 'summarize', timeoutMs: 30 }
+  const fetchMock = () => new Promise(() => {}) // 永不返回
+  const out = await applyOps('原文', [{ op: 'stub' }, slowOp], { fetch: fetchMock, llm: { apiKey: 'k' } })
+  assert.equal(out, '[reasoning omitted: 2 chars]', '超时后应保留上一步结果')
+})
+
+test('python op：JSON 协议（mock spawn）', async () => {
+  const makeChild = (stdout, code = 0) => ({
+    stdout: { on: (e, f) => { if (e === 'data') setTimeout(() => f(stdout), 0) } },
+    stderr: { on: () => {} },
+    stdin: { end: () => {} },
+    on: (event, fn) => { if (event === 'close') setTimeout(() => fn(code), 5) },
+    kill: () => {},
+  })
+  const spawnMock = () => makeChild('{"text":"py 处理结果"}\n')
+  const out = await applyOps('原始文本', [{ op: 'python', script: 'shaper.py' }], { spawn: spawnMock })
+  assert.equal(out, 'py 处理结果')
+})
+
+test('python op：纯文本协议与退出码非 0', async () => {
+  const makeChild = (stdout, code) => ({
+    stdout: { on: (e, f) => { if (e === 'data') setTimeout(() => f(stdout), 0) } },
+    stderr: { on: (e, f) => { if (e === 'data') setTimeout(() => f('boom'), 0) } },
+    stdin: { end: () => {} },
+    on: (event, fn) => { if (event === 'close') setTimeout(() => fn(code), 5) },
+    kill: () => {},
+  })
+  const okText = await applyOps('x', [{ op: 'python', script: 's.py', protocol: 'text' }], { spawn: () => makeChild('纯文本结果', 0) })
+  assert.equal(okText, '纯文本结果')
+  const failed = await applyOps('x', [{ op: 'stub' }, { op: 'python', script: 's.py' }], { spawn: () => makeChild('', 2) })
+  assert.equal(failed, '[reasoning omitted: 1 chars]', '子进程失败应跳过该 op')
+})
+
+test('未知 op 被跳过（fail-open）', async () => {
+  assert.equal(await applyOps('hello', [{ op: 'no-such-op' }, { op: 'stub' }]), '[reasoning omitted: 5 chars]')
+  assert.equal(await applyOps('hello', [{ op: 'drop' }]), null)
 })
 
 test('op 组合：policy.reasoning 用链式序列', async () => {
@@ -277,11 +353,6 @@ test('op 组合：全 keep 时不产生任何事件（不做无谓替换）', as
   })
   await settle()
   assert.equal(appends.length, 0)
-})
-
-test('未知 op 被跳过（fail-open）', () => {
-  assert.equal(applyOps('hello', [{ op: 'no-such-op' }, { op: 'stub' }]), '[reasoning omitted: 5 chars]')
-  assert.equal(applyOps('hello', [{ op: 'drop' }]), null)
 })
 
 test('非 assistant/message 事件被跳过', async () => {

@@ -82,6 +82,113 @@ export const OPS = {
     const tail = max - head
     return `${t.slice(0, head)}\n…（省略 ${t.length - max} 字符）…\n${t.slice(-tail)}`
   },
+
+  /**
+   * Python 接口：把文本通过 stdin 交给用户脚本，读 stdout 作为塑形结果。
+   *
+   * 协议（默认 json）：stdin 收到一行 JSON `{"text": "...", "kind": "reasoning", "meta": {...}}`；
+   * stdout 若是 `{"text": "..."}` 则取该字段，否则取 stdout 原文（trim 后）。
+   * 退出码非 0 / 超时 / 输出为空 ⇒ 抛错 ⇒ 该 op 被跳过（fail-open，保留上一步结果）。
+   *
+   * 注：spawn 可经 ctx.spawn 注入（便于测试）；默认用 node:child_process。
+   */
+  python: async (text, op, ctx) => {
+    const spawn = ctx.spawn ?? (await import('node:child_process')).spawn
+    const command = op.command ?? 'python'
+    const args = [op.script, ...(op.args ?? [])]
+    if (!op.script) throw new Error('python op 需要配置 script 路径')
+    const protocol = op.protocol ?? 'json'
+    const input = protocol === 'text'
+      ? String(text ?? '')
+      : `${JSON.stringify({ text: text ?? '', kind: ctx.kind ?? null, meta: ctx.meta ?? {} })}\n`
+    const timeout = op.timeoutMs ?? 8000
+
+    return await new Promise((resolve, reject) => {
+      let child
+      try {
+        child = spawn(command, args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
+      } catch (error) {
+        reject(error)
+        return
+      }
+      let stdout = ''
+      let stderr = ''
+      let settled = false
+      const timer = setTimeout(() => {
+        if (settled) return
+        settled = true
+        try { child.kill() } catch { /* 忽略 */ }
+        reject(new Error(`python op 超时（${timeout}ms）`))
+      }, timeout)
+      if (typeof timer.unref === 'function') timer.unref()
+
+      child.stdout?.on('data', (d) => { stdout += String(d) })
+      child.stderr?.on('data', (d) => { stderr += String(d) })
+      child.on('error', (error) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        reject(error)
+      })
+      child.on('close', (code) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        if (code !== 0) {
+          reject(new Error(`python 退出码 ${code}${stderr ? `：${stderr.slice(0, 200)}` : ''}`))
+          return
+        }
+        const raw = stdout.trim()
+        if (raw === '') { reject(new Error('python 输出为空')); return }
+        if (protocol === 'json' && raw.startsWith('{')) {
+          try {
+            const parsed = JSON.parse(raw)
+            if (typeof parsed?.text === 'string') { resolve(parsed.text); return }
+          } catch { /* 当纯文本处理 */ }
+        }
+        resolve(raw)
+      })
+      try {
+        child.stdin?.end(input)
+      } catch { /* 忽略 */ }
+    })
+  },
+
+  /**
+   * OpenAI 兼容的 LLM 塑形：`POST {baseURL}/chat/completions`，显式提示词，温度 0。
+   * 出网前可经 ctx.redact 脱敏；失败/超时/空返回 ⇒ 抛错 ⇒ 该 op 跳过（fail-open）。
+   * fetch / apiKey 均可注入（便于测试与复用主会话凭据）。
+   */
+  summarize: async (text, op, ctx) => {
+    const fetchFn = ctx.fetch ?? globalThis.fetch
+    if (typeof fetchFn !== 'function') throw new Error('没有可用的 fetch')
+    const baseURL = (op.baseURL ?? ctx.llm?.baseURL ?? 'https://api.deepseek.com').replace(/\/+$/u, '')
+    const apiKey = op.apiKey ?? ctx.llm?.apiKey ?? process.env.DEEPSEEK_API_KEY ?? ctx.apiKey
+    if (!apiKey) throw new Error('summarize op 缺少 apiKey')
+    const model = op.model ?? ctx.llm?.model ?? 'deepseek-flash'
+    const prompt = op.prompt
+      ?? '把下面的内容压成简短要点，保留数字、路径、标识符与结论；不要添加原文没有的信息。'
+    const payloadText = typeof ctx.redact === 'function' ? ctx.redact(String(text ?? '')) : String(text ?? '')
+    const res = await fetchFn(`${baseURL}/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model,
+        stream: false,
+        temperature: 0,
+        max_tokens: op.maxTokens ?? 256,
+        messages: [
+          { role: 'system', content: prompt },
+          { role: 'user', content: payloadText },
+        ],
+      }),
+    })
+    if (!res.ok) throw new Error(`LLM ${res.status}`)
+    const json = await res.json()
+    const out = json?.choices?.[0]?.message?.content
+    if (typeof out !== 'string' || out.trim() === '') throw new Error('LLM 返回为空')
+    return out.trim()
+  },
 }
 
 /**
@@ -92,16 +199,44 @@ export const OPS = {
  * @param ctx - 上下文（stubTemplate 等）
  * @returns 处理后的文本，或 null（删除）
  */
-export function applyOps(text, ops, ctx = {}) {
+/**
+ * 把一条 op 序列作用到文本上。op 是"文本 → 文本"的纯函数（**也可以是 async 的**，
+ * 例如调用 LLM 或外部进程），因此可以任意链式组合；返回 null 表示这条内容应整块删除。
+ *
+ * 每个 op 都受 timeoutMs 约束（默认 ctx.opTimeoutMs = 8000）：超时/抛错 ⇒ 该 op 跳过
+ * （保留上一步的结果），绝不阻断会话。
+ * @param text - 原始文本
+ * @param ops - op 序列（[{ op, ...参数 }]）
+ * @param ctx - 上下文（stubTemplate / fetch / spawn / log / opTimeoutMs 等）
+ * @returns Promise<string|null>
+ */
+export async function applyOps(text, ops, ctx = {}) {
   if (!Array.isArray(ops) || ops.length === 0) return text
   let out = text
   for (const op of ops) {
     const fn = OPS[op?.op]
     if (typeof fn !== 'function') continue // 未知 op 跳过（fail-open）
-    out = fn(out, op, ctx)
-    if (out === null || out === undefined) return null
+    try {
+      const timeout = op.timeoutMs ?? ctx.opTimeoutMs ?? 8000
+      out = await withTimeout(Promise.resolve(fn(out, op, ctx)), timeout)
+      if (out === null || out === undefined) return null
+    } catch (error) {
+      ctx.log?.(`op ${op?.op} 失败，跳过：${error?.message ?? error}`)
+    }
   }
   return out
+}
+
+/** 超时护栏：op（尤其 LLM / 外部进程）不能把会话挂住。 */
+function withTimeout(promise, ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return promise
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      const t = setTimeout(() => reject(new Error(`op 超时（${ms}ms）`)), ms)
+      if (typeof t.unref === 'function') t.unref()
+    }),
+  ])
 }
 
 /** 决策句识别（确定性、零成本）：只按句式挑，不按位置截断。 */
@@ -150,11 +285,40 @@ export function apply(ctx, config = {}) {
 
   log(
     `applied pid=${process.pid} enabled=${cfg.enabled} dropReasoning=${cfg.dropReasoning}`
+    + ` policy=${Object.entries(cfg.policy ?? {}).map(([k, v]) => `${k}:${(v?.ops ?? []).map((o) => o?.op).join('→') || 'keep'}`).join(',')}`
     + ` log=${LOG} off=${existsSync(OFF)}`,
   )
 
+  /** 交给 op 的上下文：可注入 fetch/spawn（便于测试），LLM 凭据与脱敏也走这里。 */
+  const baseOpCtx = {
+    stubTemplate: cfg.stubTemplate,
+    opTimeoutMs: cfg.opTimeoutMs ?? 8000,
+    llm: cfg.llm,
+    fetch: cfg.fetch,
+    spawn: cfg.spawn,
+    redact: cfg.redact,
+    log,
+  }
+
+  /**
+   * 栈护栏（为什么不会把前缀打崩）：
+   *   1. 只处理 surfaceOp === 'append' 的**刚追加**事件，替换范围恰为它自己
+   *      （start === end === event.seq）⇒ **从不触碰更早的 seq**；
+   *   2. 若该 seq 已不在当前表面上（被别人替换/已被压缩覆盖）⇒ 直接放弃，绝不插一脚；
+   *   3. 所有 op（尤其 LLM / 外部进程）受 opTimeoutMs 约束，超时即跳过 ⇒ 最坏情况是
+   *      "没省到"，不会是"改了已发送的内容"；
+   *   4. 记录从事件追加到定型落地的延迟，超过阈值就告警——这是"定型早于首次发送"的
+   *      可观测证据（若哪天看到它告警，说明时序假设被破坏，应立即停手排查）。
+   */
   const onEvent = (session, event) => {
-    try {
+    void handleEvent(session, event).catch((error) => {
+      stats.failed += 1
+      try { log(`HANDLER FAILED seq=${event?.seq} err=${error?.message ?? error}（fail-open）`) } catch { /* 忽略 */ }
+    })
+  }
+
+  async function handleEvent(session, event) {
+    {
       if (!cfg.enabled || !cfg.dropReasoning) return
       stats.events += 1
 
@@ -167,6 +331,14 @@ export function apply(ctx, config = {}) {
       if (!event || !Number.isInteger(event.seq)) return
       // 只处理原始追加事件；带 replace 语义的事件（含本插件自己造的）一律跳过
       if (event.surfaceOp !== undefined && event.surfaceOp !== 'append') return
+
+      // 护栏 2：该 seq 必须仍在当前表面上。若已被别人替换/被压缩覆盖，
+      // 就说明它已经不是"栈顶待定型"的那个元素了 —— 放弃，绝不插一脚。
+      const surfaceNodes = session?.surface?.nodes
+      if (Array.isArray(surfaceNodes) && !surfaceNodes.includes(event.seq)) {
+        stats.notOnSurface = (stats.notOnSurface ?? 0) + 1
+        return
+      }
 
       const policy = { ...DEFAULTS.policy, ...(cfg.policy ?? {}) }
       // 兼容旧配置：reasoningMode → policy.reasoning.ops。
@@ -186,24 +358,22 @@ export function apply(ctx, config = {}) {
         if (!Array.isArray(blocks)) return
         const ops = policy.toolResult?.ops ?? []
         if (ops.length === 0 || ops.every((o) => o?.op === 'keep' || o?.op === undefined)) return
+        const opCtx = { ...baseOpCtx, kind: 'toolResult' }
         let changed = false
-        const shaped = blocks.map((block) => {
-          if (block?.type !== 'tool-result' || !Array.isArray(block.content)) return block
-          return {
-            ...block,
-            content: block.content.map((part) => {
-              if (typeof part?.text !== 'string') return part
-              const after = applyOps(part.text, ops, { stubTemplate: cfg.stubTemplate })
-              if (after === null || after === part.text) return after === null ? null : part
-              changed = true
-              return { ...part, text: after }
-            }).filter(Boolean),
+        const shaped = []
+        for (const block of blocks) {
+          if (block?.type !== 'tool-result' || !Array.isArray(block.content)) { shaped.push(block); continue }
+          const parts = []
+          for (const part of block.content) {
+            if (typeof part?.text !== 'string') { parts.push(part); continue }
+            const after = await applyOps(part.text, ops, opCtx)
+            if (after === null) { changed = true; continue }
+            if (after !== part.text) { changed = true; parts.push({ ...part, text: after }) } else parts.push(part)
           }
-        })
+          shaped.push({ ...block, content: parts })
+        }
         if (!changed) return
-        const nextData = cfg.dropUsageOnReplace
-          ? { ...event.data, message: { ...event.data.message, content: shaped } }
-          : { ...event.data, message: { ...event.data.message, content: shaped } }
+        const nextData = { ...event.data, message: { ...event.data.message, content: shaped } }
         queueMicrotask(() => {
           try {
             session.append('tool/result', nextData, {
@@ -244,14 +414,14 @@ export function apply(ctx, config = {}) {
       let changed = false
       let chars = 0
       let keptChars = 0
-      const ctx = { stubTemplate: cfg.stubTemplate }
+      const opCtx = { ...baseOpCtx, kind: 'assistant' }
 
       for (const block of content) {
         const kind = kindOf(block)
         if (kind === null) { kept.push(block); continue }
         const field = kind === 'toolArgs' ? 'arguments' : 'text'
         const before = typeof block?.[field] === 'string' ? block[field] : ''
-        let after = applyOps(before, policy[kind]?.ops ?? [], ctx)
+        let after = await applyOps(before, policy[kind]?.ops ?? [], { ...opCtx, kind })
 
         if (kind === 'reasoning') {
           chars += before.length
@@ -298,7 +468,7 @@ export function apply(ctx, config = {}) {
         : { ...event.data, message: { ...message, content: kept } }
 
       // 在 microtask 里追加，避免在事件发布过程中嵌套派发；
-      // 距离下一次 LLM 请求仍有整个工具执行阶段，时序完全够。
+      // 距离下一次 LLM 请求仍有整个工具执行阶段，时序完全够（延迟会被下面量出来）。
       queueMicrotask(() => {
         try {
           session.append('assistant/message', nextData, {
@@ -311,11 +481,21 @@ export function apply(ctx, config = {}) {
           stats.chars += chars
           if (emptyFixed) stats.emptyFixed += 1
 
+          // 护栏 4：量"追加 → 定型"的延迟。这是"定型早于首次发送"的可观测证据：
+          // 一旦它显著变大，说明时序假设被破坏，应当立即用哨兵停手排查。
+          const appendedAt = typeof event.time === 'number' ? event.time : null
+          const lagMs = appendedAt === null ? null : Date.now() - appendedAt
+          if (lagMs !== null && lagMs > (cfg.lagWarnMs ?? 2000)) {
+            stats.lagWarnings = (stats.lagWarnings ?? 0) + 1
+            log(`WARN 定型延迟过大 lag=${lagMs}ms seq=${event.seq}（时序假设可能被破坏，考虑停手）`)
+          }
+
           if (stats.stripped === 1) {
             log(
               `strip #1 seq=${event.seq} turn=${event.data?.turn} step=${event.data?.step}`
               + ` blocks=${reasoning.length} chars=${chars}${emptyFixed ? ' empty-fixed' : ''}`
-              + ` provenance=${provenance.length} 项(首/末=${provenance[0]}/${provenance.at(-1)})`,
+              + ` provenance=${provenance.length} 项(首/末=${provenance[0]}/${provenance.at(-1)})`
+              + ` lag=${lagMs ?? 'n/a'}ms`,
             )
           } else if (stats.stripped % 25 === 0) {
             log(
@@ -331,11 +511,6 @@ export function apply(ctx, config = {}) {
           } catch { /* 忽略 */ }
         }
       })
-    } catch (error) {
-      stats.failed += 1
-      try {
-        log(`FAILED seq=${event?.seq} type=${event?.type} err=${error?.message ?? error} (fail-open，已跳过)`)
-      } catch { /* 忽略 */ }
     }
   }
 
