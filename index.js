@@ -984,11 +984,20 @@ export function apply(ctx, config = {}) {
   // 另外 llm 服务若在 apply 时尚未就绪，惰性重试能自愈（旧版直接放弃）。
   let proxyRegistered = false
   let proxyFailLogged = ''
+  let proxyWaitingLogged = false
   const ensureProxy = () => {
     if (proxyRegistered || !cfg.proxy?.enabled) return
     try {
       const llm = typeof ctx.get === 'function' ? ctx.get('llm') : undefined
-      if (!llm || typeof llm.registerAdapter !== 'function') return   // 服务未就绪 ⇒ 下次再试（不刷日志）
+      if (!llm || typeof llm.registerAdapter !== 'function') {
+        // 服务尚未就绪。**必须留痕**：这一刻不注册，提供方在选择器里就不存在，
+        // 而调用方（界面）看不出原因 —— 本机实测过"刚重启后一段时间看不到代理提供方"。
+        if (!proxyWaitingLogged) {
+          proxyWaitingLogged = true
+          log('proxy 等待 llm 服务就绪（此刻尚未注册 ⇒ 模型选择器里暂时看不到该提供方）')
+        }
+        return
+      }
       const alias = cfg.proxy.provider ?? 'deepseek-shaped'
       const upstream = cfg.proxy.upstream ?? 'deepseek-official'
       /**
@@ -1051,6 +1060,26 @@ export function apply(ctx, config = {}) {
     }
   }
   ensureProxy()
+  /**
+   * 启动期**主动**重试注册：`ctx.get('llm')` 在 apply 时往往还没就绪（实测：apply 时拿不到，
+   * 直到第一次 LLM 调用才通过惰性路径补上 —— 中间那 2~3 分钟里，**模型选择器里看不到
+   * 本插件注册的提供方**，用户会以为"插件没生效"）。
+   * 这里用几个 unref 的定时器把窗口压到毫秒级；惰性路径仍然保留作为兜底。
+   * 若最终仍未注册成功，写一条**显式告警**（而不是静默）。
+   */
+  if (cfg.proxy?.enabled && !proxyRegistered) {
+    const delays = [0, 50, 150, 400, 1000, 2500, 5000, 10000]
+    for (const delay of delays) {
+      const t = setTimeout(() => {
+        ensureProxy()
+        if (delay === delays.at(-1) && !proxyRegistered) {
+          log('WARN proxy 启动期重试仍未注册成功 ⇒ 模型选择器里不会有该提供方；'
+            + '下一次 LLM 调用会再试一次（可用哨兵停手排查）')
+        }
+      }, delay)
+      if (typeof t.unref === 'function') t.unref()
+    }
+  }
 
   /**
    * ── 推理的塑造走"流过滤"，不走表面替换 ──

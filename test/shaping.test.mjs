@@ -500,6 +500,21 @@ test('统一协议 inline.code：源码字符串（可热改），且总是走�
   assert.equal(compiled.length, 1, '缓存命中时不再编译')
 })
 
+test('代理：llm 服务未就绪时留痕（否则提供方在选择器里消失且看不出原因）', () => {
+  // 实测现场：重启后 apply 时拿不到 llm 服务 ⇒ 不注册 ⇒ **模型选择器里看不到本插件的
+  // 提供方**，而日志里一片安静 ⇒ 用户以为"插件没生效"。现在必须有一条留痕日志。
+  caseNo += 1
+  const logPath = join(TMP, `wait-proxy-${caseNo}.log`)
+  const listeners = []
+  const ctx = { on: (n, h) => { listeners.push({ n, h }); return () => {} }, get: () => undefined }
+  apply(ctx, {
+    logPath, offSentinel: join(TMP, 'no.OFF'), configPath: join(TMP, `none-${caseNo}.json`),
+    cache: { enabled: false }, proxy: { enabled: true },
+  })
+  const text = readFileSync(logPath, 'utf8')
+  assert.ok(text.includes('proxy 等待 llm 服务就绪'), `应留下"等待服务"的日志。实得：\n${text}`)
+})
+
 test('旧名兼容：python / summarize 与统一协议实现等价', async () => {
   const spy = spySpawn(fakeChild({ stdout: '{"text":"ok"}' }))
   const viaAlias = await applyOps('t', [{ op: 'python', script: 's.py' }], { spawn: spy.spawn })
