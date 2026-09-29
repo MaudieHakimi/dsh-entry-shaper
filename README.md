@@ -54,7 +54,7 @@ DSH 的 `compaction` 在**出口**改历史：把已发送的区间换成摘要�
 打断前缀缓存 —— 从改动点往后**整份 payload 按全价重算**（"断点税"）。在缓存命中价极低的
 provider 上（DeepSeek 命中/未命中 ≈ **1/50**），这笔税常常比省下的钱还贵。
 
-本机实测（会话 `session-acde5be7-…`，见 [`docs/OFFICIAL-STACK.md`](docs/OFFICIAL-STACK.md)）：
+本机实测（一个 2739 步的长会话，见 [`docs/OFFICIAL-STACK.md`](docs/OFFICIAL-STACK.md)）：
 
 | 通道 | 削掉的 token | 全价重算（断点税） | 比值 |
 |---|---|---|---|

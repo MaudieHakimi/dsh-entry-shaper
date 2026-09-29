@@ -1,13 +1,18 @@
-// dsh-entry-shaper —— 入口塑造（payload shaping）探针/实现
+// dsh-entry-shaper —— 入口塑造（payload shaping）
 //
 // 主张：会话是一根只进不出的栈。每个元素在**被首次发送之前**定型，此后永不改写，
 // 那么下一次请求的 payload 就是本次的**严格前缀** ⇒ 前缀缓存全命中 ⇒ 零断点税。
 //
-// 当前只实现一件事：assistant/message 一被追加，就把它的 reasoning 块摘掉。
-//   * reasoning 生成于本次调用，首次回传发生在**下一次**请求 ⇒ 摘掉不打断任何已发送的前缀
-//   * 已实测（见 .research/probe-reasoning-passback.mjs）：DeepSeek 接受"带 tool_calls
-//     但缺 reasoning_content"的 assistant 消息（200 OK，回答正确）
-//   * 原始记录仍在会话日志里（append-only 不破），只是表面投影不再包含它
+// 默认路径（代理通道）：注册一个 provider 路由，把 deriveMessages() 产出的 messages
+// 按**内容类别**跑 op 链后转交上游 ⇒ 日志与界面永远保留原文，只有发出去的那一份被塑形。
+// 类别：reasoning（默认 `extract` 决策句抽取）/ toolResult / toolArgs / assistantText。
+//
+// 另有两条实验通道（默认关）：
+//   * `llm/stream` 中间件：把推理 chunk 攒起、只吐一个塑形后的 chunk（代理开启时它让路）
+//   * `session/event` 表面替换：只对 tool/result 这类合法目标生效
+//     （assistant/message 的表面替换被两个互相矛盾的校验器堵死，见下方注释）
+//
+// 来源声明：本文件与仓库其余部分**完全由 DeepSeek-V4.1-Flash 生成**（见 README）。
 //
 // 机制（与官方/既有插件同源）：
 //   观察：ctx.on('session/event', (session, event) => …)     // core/session/src/index.ts:76
