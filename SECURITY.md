@@ -29,13 +29,15 @@
 | 写日志 | 只要 `logStats`（默认开） | `~/.dsh-entry-shaper.log`（**只记字符数，不记内容**） |
 | 读配置 | 每次调用前按 mtime 检查 | `~/.dsh-entry-shaper.config.json`（你自己的文件） |
 | 读哨兵 | 每 64 事件 / 每次出网 | `~/.dsh-entry-shaper.OFF`（存在即停手） |
-| 读写结果缓存 | 仅当用了**非纯 op**（`summarize` / `python`）且 `cache.enabled` | `~/.dsh-entry-shaper.cache.jsonl`（**只存塑形后的摘要，不存原文**；8 MB 上限 + 轮转） |
-| **发 HTTP** | 仅当你使用 `summarize` op，或打开代理通道（转调上游 LLM） | 你配置的 endpoint；`summarize` 的 apiKey 依次取 `op.apiKey → llm.apiKey → DEEPSEEK_API_KEY` |
-| **起子进程** | 仅当你使用 `python` op | 你配置的 `script` / `command`；收 stdin JSON，读 stdout |
+| 读写结果缓存 | 仅当用了**不可证明为纯的 op**（`exec` / `http` / `inline.code` / 自定义注入）且 `cache.enabled` | `~/.dsh-entry-shaper.cache.jsonl`（**只存塑形后的结果，不存原文**；8 MB 上限 + 轮转） |
+| **发 HTTP** | 仅当你使用 `http` op（旧名 `summarize`），或打开代理通道（转调上游 LLM） | 你配置的 endpoint；`http` 的 apiKey 依次取 `op.apiKey → ctx.llm.apiKey → DEEPSEEK_API_KEY` |
+| **起子进程** | 仅当你使用 `exec` op（旧名 `python`） | 你配置的 `command` / `args` / `cwd` / `env`；stdin 按 `protocol` 送信封 JSON 或纯文本，读 stdout |
 
-> ⚠️ **`python` op 会执行你指定的本地脚本，`summarize` op 会把待塑形文本发到你指定的
-> endpoint。** 两者都由你的配置显式启用，请只指向你自己信任的脚本与端点。
-> 若你在 `redact` 槽位里注入了脱敏函数，`summarize` 的出网文本会先经它处理。
+> ⚠️ **`exec` op 会执行你指定的本地命令，`http` op 会把待塑形文本发到你指定的 endpoint。**
+> 两者都由你的配置显式启用，请只指向你自己信任的命令与端点。
+> `inline.code` 等价于**在 DSH 进程里执行你写的代码**（`code` 是函数体源码，从你自己的
+> 配置文件读入）—— 与 `exec` 同级风险，请只写你自己的代码。
+> 若你在 `redact` 槽位里注入了脱敏函数，`http` 的出网文本会先经它处理。
 
 ## 失败模式
 
@@ -55,14 +57,18 @@
   探索与试错过程不进 payload；
 - **人类看到的内容不变**：界面与审计仍读 append 原文（这也是"感觉变简短但日志是全的"的原因）；
 - **token 统计不变**：表面替换不复制 `usage`（否则会双计）；
-- **前缀不变**（设计目标）：塑形是纯函数，非纯 op 走内容哈希缓存 ⇒ 同一条旧消息每次出网形态恒定。
+- **前缀不变**（设计目标）：塑形是纯函数，不可证明为纯的 op 走内容哈希缓存
+  ⇒ 同一条旧消息每次出网形态恒定。**实测**：出网 payload −40%~−47%、缓存命中 98.4%~99.6%、
+  正常回合未命中仅等于"新增量"（零断点）。
 
 ## 边界（有意的取舍）
 
 - 本插件**不做脱敏**：没有任何内置的密钥/隐私识别规则。要脱敏请在 `redact` 槽位注入你自己的
-  函数（`summarize` 出网前会调用它）。**不要指望它替你挡住密钥泄漏**；
+  函数（`http` 出网前会调用它）。**不要指望它替你挡住密钥泄漏**；
 - 本插件**不校验上游**：代理只是把请求转发给 `proxy.upstream` 指定的路由，
-  该路由是不是你以为的那个，取决于你的 `settings.yaml` / 凭据配置。
+  该路由是不是你以为的那个，取决于你的 `settings.yaml` / 凭据配置；
+- 本插件**不参与排障**：它不会导致账单放大（只在出网前做纯函数变换、不发任何请求）；
+  若账单异常，先查 `web_search`（服务端多回合）与子代理扇出 —— 两者的量级远大于本插件省下的量。
 
 ## 报告问题
 

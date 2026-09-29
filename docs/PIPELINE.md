@@ -77,7 +77,7 @@
 | 5 | session | 表面折叠 op、校验表面契约 | `packages/core/session/src/surface.ts:185-205`、`:331-345` |
 | 6 | token-meter | 校验 provenance（source 必须是同 step 的 chunk、不重复、严格更早） | `packages/llm/token-meter/src/index.ts:279-304` |
 | 7 | agent loop | `deriveMessages()` → `buildRequest()`（结果 `deepFreeze`）→ `llm.stream()` | `packages/core/agent-loop/src/agent.ts:341`、`:505` |
-| 8 | provider | 前缀缓存按**逐字前缀**命中（实测 `miss=250 hit=128`） | 探针 `.research/probe-reasoning-passback.mjs` |
+| 8 | provider | 前缀缓存按**逐字前缀**命中（实测 `miss=250 hit=128`） | 探针 `tools/probe-reasoning-passback.mjs` |
 | 9 | host apiproxy | 界面分页只数 append-origin 消息；替换副本不计额 | `packages/host/apiproxy/src/api-proxy.ts:218-227` |
 
 ## 3. 元素生命周期：为什么这样做是免费的
@@ -153,7 +153,7 @@ patch 里 enabled: false        → 完全不订阅动作（需重启）
 │      assistant.reasoning → policy.reasoning      tool-result  → policy.toolResult│
 │      assistant.text      → policy.assistantText  tool-call.args→ policy.toolArgs │
 │      role==='user'       → 永不触碰                                              │
-│ ③ 纯 op 天然确定；非纯 op（summarize/python）走 sha256(指纹+参数+输入) 缓存       │
+│ ③ 纯 op 天然确定；不可证明为纯的 op（exec / http / inline.code）走内容哈希缓存   │
 │ ④ onShaped({before,after}) → 日志 proxy-shape #n chars=A→B（自证省幅）          │
 └──────────────────────────────────────────────────────────────────────────────┘
         │ 转调上游：llm.stream({ ...options, provider: proxy.upstream })
@@ -164,8 +164,13 @@ patch 里 enabled: false        → 完全不订阅动作（需重启）
 ```
 
 **为什么这条是免费的**（§3 的结论在这里最强）：`shapeMessages` 是**逐消息纯函数**
-（非纯 op 靠内容哈希缓存兜住确定性）⇒ 同一条旧消息在**每一次**出网都是同一个形态
+（不可证明为纯的 op 靠内容哈希缓存兜住确定性）⇒ 同一条旧消息在**每一次**出网都是同一个形态
 ⇒ 请求 n 与 n+1 的前缀逐字相同 ⇒ **全命中，零断点税**。
+
+**实测（2026-09，两个长会话）**：出网 payload **−40.1% / −46.6%**；缓存命中
+**98.41%（9 天 2739 步）/ 99.58%（7 天 1085 步）**；正常回合未命中 **1,148–4,140 token**
+（≈ 每步新增量 ⇒ 零断点）；正常回合成本 **$0.019–0.038**。
+取证：插件自证日志 `proxy-shape`，或 `dsh-llm-tap` 的 `~/.dsh-llm-tap/llm-tap.jsonl`。
 
 本机实测：出网 −40.1%（13 对 `callId` 配对），命中率 99.3%，命中量按新增量平稳递增。
 取证：`dsh-llm-tap` 的 `~/.dsh-llm-tap/llm-tap.jsonl`，或本插件自己的 `proxy-shape` 日志。

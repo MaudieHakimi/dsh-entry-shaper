@@ -3,10 +3,18 @@
 > 把上下文压缩从**出口**挪到**入口**：元素在被首次发送之前定型，此后永不改写 ⇒
 > payload 前缀永远单调 ⇒ **零断点税**地缩小上下文。
 
-**状态**：实验性 · **默认关闭** · 测试 61/61 · Node ≥ 20 · MIT
+**状态**：实验性 · **默认关闭** · 测试 81/81 · Node ≥ 20 · MIT
 
-**实测**（本机真实会话 + 真实 API）：出网 payload **−40.1%**，缓存命中率 **99.3%**，
-日志与界面保留原文。取证方法见[§ 实测数据](#实测数据)。
+**实测**（本机真实会话 + 真实 API，最新一次）：
+
+| 指标 | 实测值 |
+|---|---|
+| 出网 payload 缩减 | **−46.6%**（插件自证日志 `proxy-shape`，长会话 03/04 两天分别 −40.1% / −46.6%） |
+| 缓存命中率 | **98.4% ~ 99.6%**（9 天 2739 步的长会话 / 7 天 1085 步的会话） |
+| 正常回合的未命中 | **1,148 ~ 4,140 token**（≈ 每步新增量 ⇒ 零断点） |
+| 正常回合成本 | **$0.019 ~ $0.038 / 回合** |
+
+取证方法见[§ 实测数据](#实测数据)；日志与界面**永远保留原文**。
 
 ---
 
@@ -381,6 +389,41 @@ op 可任意链式组合，**可以是 async**，统一受 `opTimeoutMs`（默�
 > 对照：一次断点付的是**整份 payload 全价**（$1/M）。所以"省 40% 的命中价"和"招来一次断点"
 > 完全不是一个量级 —— 这也是为什么**前缀单调**比"省得多"更重要。
 
+### 1b. 成本结构实测：钱到底花在哪（2026-09 多会话审计）
+
+这部分**与本插件无关**，但决定了它值不值 —— 实测自本机 9 天/2739 步（759,991,919 输入）
+与 7 天/1085 步（380,897,683 输入）两个长会话：
+
+| 事实 | 实测 |
+|---|---|
+| **成本 ≈ 步数 × payload** | 单回合 `18 步 × 峰值 payload 507,255 = 输入 9,061,476`（$0.67）；其余回合同样吻合 |
+| **未命中只占输入 ~1.6%，却占 ~57% 的钱** | 命中价 / 未命中价 = `$0.02 / $1`（相差 50 倍） |
+| **最大单项支出是"断点税"** | 2739 步会话：182 次断点、断点税占未命中的 **87%**（$10.59 / 总 $27.08） |
+| **断点主因是"隔太久回来"（缓存 TTL）** | 间隔 1060 min → miss 497,394；间隔 7158 min → miss 266,259；而间隔 0.1 min 的步 miss 仅 ~500–1,400 |
+
+**间隔 vs 平均命中率**（同一会话 2694 步全样本，实测）：
+
+| 距上一步 | 样本 | 平均命中率 |
+|---|---|---|
+| `<1 min` | 2501 | 96.7% |
+| `1–3 min` | 118 | 94.6% |
+| `3–6 min` | 46 | 90.0% |
+| `6–15 min` | 13 | 66.2% |
+| `>15 min` | 17 | 63.2% |
+
+⇒ **"隔一会儿回来"的罚金 = 整份 payload 全价**，而这正是本插件能间接帮上忙的地方：
+payload 减半 ⇒ 同样一次隔夜回来的罚金也同比减少约 46% ✓。
+
+**另外两个与插件无关、但会瞬间把账单打穿的放大源**（实测踩过）：
+
+| 放大源 | 机制 | 实测 |
+|---|---|---|
+| **搜索** `web_search` | 一次请求 = 服务端**最多 5 个模型回合**（`max_uses` 默认 5），结果轮间累积；**这些轮次的 usage 不进会话日志** ⇒ 本地账本里是零 | 9 个会话 7 分钟内共 221 次搜索，平台账单比本地日志多 ≈ $5 |
+| **子代理递归扇出** | 主会话开子代理 → 子代理**又各自开子代理**，前缀完全不共享（缓存零复用） | 1 → 3 → 9 个并行会话，全部挤在 7 分钟内 |
+
+> 这两条的启示：**本插件不会造成任何放大**（它只在出网前做纯函数变换、不发请求），
+> 但它省的量级也远小于"一次搜索风暴" —— 排障时先看这两项，再看压缩/缓存。
+
 ### 2. 离线基准（可复现）
 
 固定轨迹重放：真实会话里同一轮内连续 12 次工具调用当剧本，两臂逐轮发前缀请求。
@@ -438,11 +481,12 @@ N=17 的配对样本不足以做强断言。
 
 | 现象 | 原因 / 处理 |
 |---|---|
-| 模型选择器里看不到代理 | 之前踩过：`listModels()` 未把 `provider` 改盖成本路由 id ⇒ 整组被判 `INVALID_CATALOG` 而不显示。已修（0.9.3）；自查：`POST /api/llm.models` 看 `failures` |
+| 模型选择器里看不到代理 | ① 之前踩过：`listModels()` 未把 `provider` 改盖成本路由 id ⇒ 整组被判 `INVALID_CATALOG` 而不显示（已修 0.9.3）；② **重启后的短暂窗口**：`ctx.get('llm')` 在 `apply()` 时尚未就绪，提供方要等注册成功才出现（1.0.1 起启动期主动重试，日志有 `proxy 等待 llm 服务就绪` / `WARN …仍未注册成功`）。自查：`POST /api/llm.models` 看 `failures`；选择器目录**按会话缓存**，刷新页面再看 |
 | 日志有 `proxy 注册失败：adapter.xxx is not a function` | 适配器缺运行时要求的成员。运行时调用 `providerInfo` / `providerRetryPolicy` / `listModels` / `resolveModel` / `prepareCall` / `stream` **全部**（`packages/llm/llm/src/index.ts`）。已修（0.9.2） |
 | 热挂载后行为没变 | 热挂载**不刷新模块缓存** ⇒ 代码改动必须重启；只有配置与开关能热改 |
 | 看得到省了多少吗 | 日志里 `proxy-shape #n chars=A→B（累计 …）`（前 3 次 + 之后每 20 次一行） |
 | 想验证出网内容 | 装 `dsh-llm-tap` 看 `~/.dsh-llm-tap/llm-tap.jsonl`，或读本插件日志的字符统计 |
+| 账单突然打穿 | **先怀疑搜索与子代理扇出，不是本插件**：`web_search` 一次请求 = 服务端最多 5 个模型回合（`max_uses` 默认 5）且这些轮次的 usage **不进会话日志**；子代理又会各自开子代理 ⇒ 并行前缀不共享、缓存零复用。见[§ 1b](#1b-成本结构实测钱到底花在哪2026-09-多会话审计) |
 | 突然行为异常 | 建 `~/.dsh-entry-shaper.OFF` 立停（原样转发），再排查 |
 
 ## 文档
@@ -451,15 +495,17 @@ N=17 的配对样本不足以做强断言。
 |---|---|
 | [`docs/OFFICIAL-STACK.md`](docs/OFFICIAL-STACK.md) | 官方三层（pruner / compaction / command-compact）的位置与阈值、一次 `/compact` 的实测账单、本插件的空位 |
 | [`docs/PIPELINE.md`](docs/PIPELINE.md) | 工作管道：总图、时序（含 harness 源码出处）、元素生命周期、降级路径、验收观测点 |
-| [`docs/PROCESSING.md`](docs/PROCESSING.md) | 处理层规范：op 目录、协议、里程碑 |
+| [`docs/PROCESSING.md`](docs/PROCESSING.md) | 处理层规范：统一协议、op 目录、里程碑与被否掉的方案 |
+| [`examples/custom-op.md`](examples/custom-op.md) | 接入自定义算法的五条路径 + 函数契约 + 热挂载取舍表 |
+| [`tools/README.md`](tools/README.md) | 会话体检与排障脚本（11 个，只读、零依赖）：命中率/断点/成本/搜索与子代理扇出定位 |
 | [`CHANGELOG.md`](CHANGELOG.md) | 变更记录（含被基准否掉的方案与踩过的坑） |
-| [`SECURITY.md`](SECURITY.md) | 边界与失败模式 |
-| [`CONTRIBUTING.md`](CONTRIBUTING.md) | 改动前必读 |
+| [`SECURITY.md`](SECURITY.md) | 边界与失败模式（含"本插件不做脱敏"这一明确边界） |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | 改动前必读（6 条硬规则 + 发版前验证清单） |
 
 ## 开发
 
 ```powershell
-node test/run-all.mjs                                          # 单测（61 例，无需 DSH 运行时）
+node test/run-all.mjs                                          # 单测（81 例，无需 DSH 运行时）
 node test/shaping.test.mjs                                     # 同上（直接跑，沙箱友好）
 node bench/replay.mjs "<session.jsonl.zstd>" --dry             # 固定轨迹重放
 node bench/divergence.mjs "<session.jsonl.zstd>" --cases=20    # 行为分歧
@@ -469,6 +515,22 @@ node bench/agentic/runner.mjs --max-rounds=20                  # agentic 基准�
 > `node --test test/` 在受限沙箱下会因 `spawn EPERM`（运行器要管道）失败 ——
 > 那是沙箱限制，不是测试问题；本地用 `node test/shaping.test.mjs`，CI 用 `node --test`。
 > 基准与检查器需要能捕获子进程输出的真实 shell；可用 `DSH_BENCH_SHELL` 指定。
+>
+> 同理：`exec` op 在受限沙箱下也会遇到 `spawn EPERM`（fail-open 会跳过该 op，
+> 表现为"没省到"而不是报错）—— 那是沙箱限制，不是插件问题。
+
+### 体检自己的会话（只读、零依赖）
+
+```powershell
+node tools/session-health.mjs "$env:USERPROFILE\.dsh\sessions\--D-DSH~0020Desktop--\<会话>\session.jsonl.zstd"
+node tools/recount-miss.mjs  "$env:USERPROFILE\.dsh\sessions"          # 多时间口径 + 逐小时
+node tools/today-turns.mjs   "$env:USERPROFILE\.dsh\sessions"          # 按回合看成本
+node tools/today-tools.mjs   "$env:USERPROFILE\.dsh\sessions"          # 哪个工具把上下文撑大
+```
+
+全部用途见 [`tools/README.md`](tools/README.md)。**账单异常时先跑这几个**，
+再怀疑本插件 —— 实测最可能的原因是 `web_search`（服务端多回合、usage 不进日志）
+与子代理递归扇出，两者量级都远大于本插件省下的量。
 
 ## 许可
 

@@ -33,6 +33,21 @@ node --test test/          # CI，跑同一批用例
    `LlmAdapter` ⇒ 基类的默认实现全都没有（踩过：`providerRetryPolicy is not a function`）。
 7. **不要把 `config:` 写进 `cordis.patch.yml`**：那会让市场**无法热挂载**
    （`dshmarket/lib/hot.js:295`）。所有可调项放 `~/.dsh-entry-shaper.config.json`，运行时热读。
+8. **新增 op 必须走统一协议**（v1.0.0 起）：op 名只表示**传输方式**（`exec` / `http` / `inline`），
+   数据格式由 `protocol` / `use` 决定，**不要**按"这是 .py / 这是 LLM"新增 op 名。
+   输入信封 `{ text, kind, meta, op, protocol: 1 }`、返回 `{text}`/`{text:null}`/原文，
+   失败只跳过该 op。详见 `docs/PROCESSING.md` §2 与 `examples/custom-op.md`。
+9. **纯度的判据是"能否证明"**，不是 op 名：能证明是纯函数的（`keep`/`extract`/…）才免缓存；
+   其余（`exec` / `http` / `inline.code` / 注入函数）**一律进缓存**。
+   改 `PURE_OPS` 前请先想清楚"结果漂移 ⇒ 前缀改变 ⇒ 付断点税"的代价。
+10. **测试必须隔离 `cache.path`**：`DEFAULTS` 指向真实主目录的
+    `~/.dsh-entry-shaper.cache.jsonl` ⇒ 不隔离会让用例互相污染、并读到本机真实缓存。
+    且 `caseNo` 是模块级计数、每次运行从同一数开始 ⇒ **同名文件要每次强制清除**。
+11. **凡是有统计/告警的路径，都要有一条"读日志文件"的用例**。踩过：
+    `stats.blocks += reasoning.length` 引用未声明标识符，抛错点在 `session.append` **之后**
+    ⇒ 表面行为完全正常，只有统计与护栏告警被静默废掉（61 个用例全都没抓住）。
+12. **修复要证伪**：新写的回归用例必须先在"故意修坏的代码"上失败过一次
+    （`git stash push -- index.js` 只撤实现、保留测试），否则它可能是一条假测试。
 
 ## 本地验证清单（发版前）
 
@@ -40,11 +55,13 @@ node --test test/          # CI，跑同一批用例
 node --check index.js
 node test/run-all.mjs
 node -e "JSON.parse(require('fs').readFileSync('package.json','utf8'))"   # 元文件可解析
-node -e "console.log(require('./index.js') ? 'exports ok' : '')"          # 可 import
+node -e "import('./index.js').then(m=>console.log(Object.keys(m).sort().join(', ')))"  # 导出面
+# patch 仍是纯 insert（可热挂载）：
+node -e "import('file:///C:/Users/CjyPi/.dsh/profiles/web/node_modules/dshmarket/lib/hot.js').then(async m=>{const fs=await import('node:fs');console.log(m.parseSimplePatch(fs.readFileSync('./cordis.patch.yml','utf8'))===null?'❌ 不可热挂载':'✅ 纯 insert')})"
 ```
 
-另外确认：`cordis.patch.yml` 仍是**纯 insert**（无 `config:`/表达式）；
-`package.json` 的 `dsh.bundle.patch` 仍指向它（否则整棵插件树挂载失败）。
+> 顺带确认：`package.json` 的 `dsh.bundle.patch` 仍指向 `./cordis.patch.yml`
+> （否则整棵插件树挂载失败），且**文档里的测试数与版本号已同步**。
 
 ## 提交规范
 

@@ -1,113 +1,114 @@
 # 处理层规范（Processing）：把"塑形"变成可组合的 op 序列
 
-> 这是设计规范，不是已实现的功能。当前实现只有 `reasoning → drop` 一个 op（见 `../index.js`）。
-> 目标：让"要不要砍、砍多少、怎么砍"变成**处理层的 op 组合 + 参数**，而不是写死在代码里。
-
----
+> **本文描述已落地的处理层**，不是规划。规划中的方案要么已实现、要么已在本文件
+> §6「被数据否掉的方案」里记录否决理由。
 
 ## 0. 定位
 
-**处理层 = 元素 → 元素的纯函数链。** 每个"刚追加、尚未发送"的元素（一个消息 + 它的若干内容块）
-进来，出去的是它的**定型形态**；定型后钉住、永不改写（见
-`dsh-context-slimmer/docs/PAYLOAD-SHAPING.md`）。质量与成本的取舍全部发生在这一层。
+**处理层 = 元素 → 元素的纯函数链。** 每个元素进来，出去的是它的**定型形态**；
+定型后钉住、永不改写 ⇒ 出网前缀单调。质量与成本的取舍全部发生在这一层。
 
 ```
-append 事件 ──► [处理层] ──► 定型事件（surfaceOp: replace，model-only）
-                  │
-                  ├─ 分类：reasoning / tool-args / tool-result / assistant-text
-                  ├─ 选 op：keep | drop | stub | keep-last-k | summarize:llm | redact
-                  └─ 失败即 skip（保留原样，绝不阻断会话）
+两条通道
+├─ 代理通道（默认路径）：deriveMessages() → op 链 → 上游 provider   ← 本文的重点
+└─ 表面通道（实验性、默认关）：session/event → 同类事件替换
 ```
 
-## 1. 不可违反的四条硬约束（任何 op 都必须满足）
+处理层的全部职责：**按内容类别，把文本从一种形态变成另一种形态**。
+它不碰 provenance、不碰 usage、不碰事件类型 —— 那些约束由内核兜（见 §1）。
 
-| # | 约束 | 出处 |
+## 1. 不可违反的约束（任何 op 都必须满足）
+
+| # | 约束 | 出处 / 后果 |
 |---|---|---|
-| 1 | 替换事件必须是**同类**表面事件（`assistant/message` → `assistant/message`） | `core/session/src/surface.ts`（`SURFACE_EVENT_TYPES` 只有三种） |
-| 2 | `sourceEventSeqs` **原样沿用**原事件（每个 source 必须是同 step 的 `assistant/chunk`、不重复、严格更早） | `llm/token-meter/src/index.ts:279-304`（违反即抛错） |
-| 3 | 替换事件**默认不复制** `usage`（meter 按事件折算 usage，复制会双计） | `llm/token-meter/src/usage-projection.ts:82-84` |
-| 4 | 摘空时补一个空 `text` 块（assistant 消息必须有 content 或 tool_calls） | `llm/llm-deepseek/src/serialize.ts:215-222` |
+| 1 | **确定性**：同一输入必须产出同一输出 | 否则同一条旧消息两次出网形态不同 ⇒ 前缀改变 ⇒ 付断点税。做不到就走 `cache`（内容哈希 + 配置指纹），**禁止有状态策略**（如"只留最近 k 条"） |
+| 2 | 表面替换时 `sourceEventSeqs` **原样沿用**原事件 | `packages/llm/token-meter/src/index.ts:279-304` —— 违反直接抛错 |
+| 3 | 表面替换**不复制** `usage` | `packages/llm/token-meter/src/usage-projection.ts:82-84` —— 否则同一步计两次 |
+| 4 | **推理块的字段必须存在** | thinking 模式下报文以 `role:'tool'` 结尾时缺 `reasoning_content` 会被 API 400 拒绝 ⇒ 内核在 op 链把它删空时**退回短桩** |
+| 5 | 转手上游元数据时 `provider` 改盖成本路由 id | `resolveModel` 违者抛 `INVALID_MODEL_INFO`；`listModels` 违者抛 `INVALID_CATALOG`（代理整组从选择器消失） |
+| 6 | 代理适配器必须是"全成员"的 | 运行时调用 `providerInfo` / `providerRetryPolicy` / `listModels` / `resolveModel` / `prepareCall` / `stream` **全部**（`packages/llm/llm/src/index.ts`）；本适配器是普通对象、不继承 `LlmAdapter` ⇒ 基类默认实现全都没有 |
+| 7 | 配置**不得**写进 `cordis.patch.yml` | 含 `config:` 行的 patch 无法热挂载（`dshmarket/lib/hot.js:295`）⇒ 所有可调项放热配置文件 |
 
-**两条不需要做的**（DSH 已保证）：原文仍在 append-only 日志里；替换副本是 **model-only**，
-界面/审计读 append-origin 事件，因此**不需要我们另存一份原文**
-（`core/session/src/surface.ts:40-68`、`host/apiproxy/src/api-proxy.ts:218-227`）。
+## 2. op 目录（统一协议）
 
-## 2. op 目录
+**op 名只表示传输方式，不表示"这是 .py / 这是 LLM"。** 详见 README 的「统一协议」一节。
 
-| op | 语义 | 适用类别 | 成本 | 质量风险 |
-|---|---|---|---|---|
-| `keep` | 原样保留 | 全部（默认） | — | — |
-| `drop` | 整块删除（空则补空 text） | reasoning | 免费 | 低（当前实现） |
-| `keep-last-k` | 只保留最近 k 个 reasoning 块（更早的 drop） | reasoning | 免费 | 低，且保留"当前思路" |
-| `stub` | 首尾保留 + 计数省略（`…省略 N 行…`） | tool-result、tool-args | 免费 | 中（当步新信息被截断） |
-| `summarize:llm` | 用 LLM 生成压缩形态 | reasoning、tool-result | 一次小调用 | 低（比 drop 保守） |
-| `redact` | 出网前抹掉机密（复用 `redactor` 槽位语义） | 全部 | 免费 | 无（安全向） |
+| 传输 | op | 数据格式 | 纯度 |
+|---|---|---|---|
+| 本地进程 | `exec` | `protocol`: `json`（信封，默认）｜`text`｜`lines`｜`argv` | 不可证明 ⇒ **进缓存** |
+| HTTP | `http` | OpenAI 形状（可 `body` 整包覆盖） | 不可证明 ⇒ **进缓存** |
+| 进程内 | `inline` | `use`: `stdout`｜`firstLine`｜`jsonField`｜`regex`｜`code` | 前四种纯；`code` 不可证明 ⇒ **进缓存** |
+| 纯函数 | `keep` `drop` `stub` `extract` `head` `tail` `truncate` `stdout` | — | **纯** ⇒ 不缓存 |
 
-**调参即组合**：例如"reasoning 保留最近 3 条 + 更早的用 LLM 摘要成一句 + tool 结果首尾 2K"，
-就是三条规则，不需要改代码。
+**统一信封**（每次调用必送）：
+`{ "text", "kind", "meta", "op", "protocol": 1 }`（`protocol` 是版本号）
+**返回值**：JSON 含字符串 `text` ⇒ 用它；含 `"text": null` ⇒ 整块删除；其它字符串 ⇒ 取原文。
+**失败**（退出码≠0 / 超时 / 空输出 / 抛错）⇒ 只跳过该 op，保留上一步结果。
 
-## 3. 槽位协议（`shaper` 槽位）
+**缓存判据**（`applyOps` 的 `provablyPure`）：**"能否证明是纯函数"**，而不是按 op 名硬编码。
+证明不了就一律缓存 —— 结果漂移 ⇒ 前缀改变 ⇒ 付断点税，比多占几 KB 磁盘贵得多。
 
-与 `dsh-context-slimmer` 的槽位体系同构（库包 / 组合包两种写法，`requiredHostVersion` 握手，
-失败跳过并记诊断）：
+**自定义 op**（`config.ops`）：注入函数（`{ 名字: (text, op, ctx) => string|null }`）
+或纯字符串映射到内置 op（`{ myalias: "extract" }`）。
+⚠️ 注入**函数**需要 patch 出现 `config:` 行 ⇒ 不可热挂载。
+想两者都要就用 `inline.code`（函数体**源码字符串**，可写进热配置文件）。
 
-```js
-// 库包形态：导出一个声明 + 一个函数
-export const id = 'shaper:reasoning-policy'
-export const requiredHostVersion = 1
-export default {
-  // 只声明"我想处理哪一类"，内核负责取块、组事件、守四条硬约束
-  match: (element) => element.kind === 'reasoning',
-  plan: (element, ctx) => ({ ops: [{ op: 'keep-last-k', k: 3 }, { op: 'drop' }], mode: 'enforce' }),
-  // 或者自己做完整决策（进阶）：拿到 host，返回定型后的 element
-  shape: (element, host) => element,
+## 3. 类别与理由
+
+| 类别 | 来源 | 默认 op | 说明 |
+|---|---|---|---|
+| `reasoning` | assistant 的 `reasoning` 块 | `extract`(240) | 官方剪枝器完全不碰推理，而它是日志里最大宗 payload ⇒ 本插件的空位 |
+| `toolResult` | `tool-result` 块的内层 `content` | `keep` | 官方 `tool-result-pruner` 已在做（8192/4096/1024），别重复造轮子 |
+| `toolArgs` | `tool-call` 的 `arguments` | `keep` | **风险最高**：参数改坏 ⇒ 工具执行错，不是"答复变差" |
+| `assistantText` | assistant 的 `text` 块 | `keep` | 不建议动 |
+| `user` | `role === 'user'` | — | **永不触碰**（硬编码跳过） |
+
+## 4. 非纯 op 的形状
+
+`exec` / `http` / 自定义注入的 op **都必须过缓存**（`cache: false` 可关，但**别关**）：
+
+- 键 = `sha256(op名 + 生效配置指纹 + op参数 + 输入文本)`；
+- 指纹里**不能有函数**（`JSON.stringify` 会丢掉它们 ⇒ 同名不同实现撞同一个键）⇒
+  **不同实现请用不同的 op 名字**；
+- `apiKey` 显式排除（否则换密钥就整体失效）；
+- 重启仍然命中（启动时把 JSONL 读进内存）⇒ 重启不打断前缀。
+
+## 5. 配置形状（实际）
+
+配置**只放** `~/.dsh-entry-shaper.config.json`（运行时按 mtime 热读，改完不用重启）。
+
+```jsonc
+{
+  "enabled": true,
+  "shapeReasoning": true,
+  "policy": {
+    "reasoning":     { "ops": [{ "op": "extract", "maxChars": 240 }] },
+    "toolResult":    { "ops": [{ "op": "keep" }] },
+    "toolArgs":      { "ops": [{ "op": "keep" }] },
+    "assistantText": { "ops": [{ "op": "keep" }] }
+  },
+  "cache": { "enabled": true, "maxBytes": 8388608, "maxEntryChars": 16384 },
+  "proxy": { "enabled": true, "provider": "deepseek-shaped", "upstream": "deepseek-official" },
+  "opTimeoutMs": 8000,
+  "lagWarnMs": 2000
 }
 ```
 
-**内核负责**（任何 shaper 都不必重复实现）：分类、按序调用、拼接、四条硬约束的校验、
-`surfaceOp` 组装、失败降级、日志与统计、`report-only` 模式（只算不写）。
+⚠️ **路径里不要写 `~`**（没有 shell 展开）⇒ 省略这些键用默认绝对路径，或写绝对路径。
 
-## 4. LLM 型 op 的形状
-
-与现有插件的 `builtin-llm-direct.js` 同一口径，避免引入新端点或新信任面：
-
-- **标准 URL**：`POST {baseURL}/chat/completions`（OpenAI 兼容），`baseURL` 与 key 来自配置，
-  默认**不**继承主会话 provider（可显式指定为同一 endpoint 以复用缓存）；
-- **显式提示词**：system + user 两段，写死在 op 定义里（可被配置覆盖），温度 0、`max_tokens` 由
-  `ops.summarize.maxTokens` 控制（默认 256）；
-- **工具**：`tools` 白名单显式声明（默认空 = 不给工具）；要复用**主会话那套工具**则显式打开
-  `ops.summarize.useSessionTools: true`（Roadmap 第 3 条）；
-- **出网前脱敏**：所有出网文本先过 `redactor`；
-- **失败即 skip**：超时（默认 5s）、非 200、解析失败 ⇒ 该 op 不生效，元素保持原样，绝不阻断会话；
-- **不进会话**：LLM 调用本身不产生会话事件（否则自己就成了上下文污染源）。
-
-## 5. 配置形状（草案）
-
-```yaml
-config:
-  enabled: true
-  mode: enforce            # enforce | report-only
-  policy:
-    reasoning:   { ops: [{ op: drop }] }                       # 当前实现
-    toolResult:  { ops: [{ op: keep }] }                       # 默认不动
-    toolArgs:    { ops: [{ op: keep }] }                       # 默认不动
-    assistantText: { ops: [{ op: keep }] }                     # 永不建议动
-  ops:
-    stub: { headTokens: 512, tailTokens: 512 }
-    summarize: { maxTokens: 256, timeoutMs: 5000, useSessionTools: false }
-```
-
-## 6. 里程碑（对照实际状态，2026-09-23）
+## 6. 里程碑（对照实际状态）
 
 | # | 内容 | 状态 |
 |---|---|---|
-| M1 | reasoning 的 `drop` / `keep-last-k`（可配置 k） | ✅ `drop`/`stub`/`extract`/`head`/`truncate` 均已实现；**`keep-last-k` 已否决**（有状态策略 ⇒ 同一条旧消息在不同出网批次形态不同 ⇒ 破坏前缀，见 §7） |
-| M2 | tool 结果的 `stub`（首尾桩） | ✅ 已实现（`toolResult` + `truncate`），**默认仍 `keep`** —— 官方 `tool-result-pruner`（8192/4096/1024）已在做，先别重复造轮子 |
-| M3 | `summarize:llm`（OpenAI 标准 URL + 显式提示词 + 脱敏 + 失败 skip） | ✅ 已实现，**带结果缓存**（非纯 op 不缓存 ⇒ 前缀抖动 ⇒ 断点税） |
-| M4 | `shaper` 槽位化（库包/组合包两种写法 + `report-only`） | ⏳ 未做。当前是内置 op 表 + `policy` 配置；槽位化的动机在 `dsh-slimmer-seams` 里另行验证过 |
-| M5 | tool-args 的 `stub`（风险最高，最后做） | ⏳ 未做（默认 `keep`）；风险与 M2 不同：参数一旦改坏，工具会**执行错**而不是"答复变差" |
-| M6 | **wire 级代理通道**（原计划里没有） | ✅ 已完成并实测：出网 −40.1%、缓存命中 99.3%、日志/界面保留原文 ⇒ **取代**了原先"表面替换"的路线（那条路被两个互相矛盾的校验器堵死，见 `index.js` 顶部注释） |
-| M7 | 可热挂载 + 配置热读 + 免重启熔断 | ✅ patch 纯 insert（市场可热挂载）、配置放 `~/.dsh-entry-shaper.config.json` 热读、哨兵即停 |
+| M1 | reasoning 的 `drop` / `stub` / `extract` / `head` / `truncate` | ✅ 已实现；**`keep-last-k` 已否决**（有状态 ⇒ 破坏前缀） |
+| M2 | tool 结果的塑形 | ✅ 已实现（`policy.toolResult`），**默认仍 `keep`**（官方 pruner 已在做） |
+| M3 | LLM 塑形 | ✅ 已实现为 `http`（OpenAI 兼容 + 显式 system + 脱敏 + 失败跳过），**带结果缓存** |
+| M4 | `shaper` 槽位化（库包/组合包 + `report-only`） | ⏳ 未做。当前是内置 op 表 + `policy`；`config.ops` / `inline.code` 已覆盖"接入自定义算法"的主要需求 |
+| M5 | tool-args 塑形 | ⏳ 未做（默认 `keep`），风险最高 |
+| M6 | **wire 级代理通道** | ✅ 已完成并实测（出网 −40%~−47%、命中 98.4%~99.6%、日志保留原文）⇒ **取代**了表面替换路线 |
+| M7 | 可热挂载 + 配置热读 + 免重启熔断 | ✅ patch 纯 insert、配置 mtime 热读、哨兵即停 |
+| M8 | **统一协议**（传输 × 数据格式） | ✅ v1.0.0：`exec` / `http` / `inline` + 统一信封与返回值；旧名 `python` / `summarize` 降为等价别名 |
+| M9 | 代理提供方"启动窗口"问题 | ✅ v1.0.1：启动期主动重试注册 + 未就绪时留痕（此前有 2~3 分钟窗口，模型选择器里看不到提供方） |
 
 **被数据否掉的方案**（别再试）：
 
@@ -117,19 +118,21 @@ config:
 | `keep-last-k`（只留最近 k 条推理） | 有状态 ⇒ 同一条旧消息两次出网形态可能不同 ⇒ 前缀改变 ⇒ 付断点税 |
 | 在线成本 A/B | 两臂共享前缀 ⇒ 后跑的那臂几乎全命中 ⇒ 数字是缓存复用假象（实测出一版 −77%，已撤回） |
 | `stub-tail` / `keep-tail` | 行为分歧实测 59% vs `extract` 的 76% ⇒ 更差 |
+| 把 `config:` 写进 patch 图省事 | 会让市场**无法热挂载** ⇒ 失去热插拔 |
 
 ## 7. 怎么判断"调参调对了"
 
-- **钱**：`dsh-context-slimmer/tools/session-cost-audit.mjs` —— 看每步输入是否下降、
-  未命中是否**没有**整份 payload 尖峰（有尖峰 = 引入了断点税，说明时机错了）；
-- **量（不依赖外部工具）**：`~/.dsh-entry-shaper.log` 里的
-  `proxy-shape #n chars=A→B（累计 …）` —— 这是本插件自己的出网字符统计；
-  要看**真实出网内容**再用 `dsh-llm-tap`（`~/.dsh-llm-tap/llm-tap.jsonl`）核对；
-- **质**：固定任务集 A/B（开/关各若干次），指标 = 任务成功率 / 返工步数 / 结论保真。
-  agentic 基准目前**未观察到退化**（短任务 8/8、长轨迹 3/3），但任务规模仍小于真实长会话
-  ⇒ 任何"不影响质量"的强断言在更长轨迹上测出来之前都不成立。
+- **健康度（最重要）**：`cacheReadTokens / (cacheReadTokens + inputTokens)` 保持在 99% 量级，
+  且**每步命中量按新增量平稳递增**（说明前缀在延长、没被重建）。这比"省了多少"更能说明问题；
+- **量**：本插件日志 `proxy-shape #n chars=A→B（累计 …）`（前 3 次 + 之后每 20 次）；
+  要核对**真实出网内容**再用 `dsh-llm-tap`（`~/.dsh-llm-tap/llm-tap.jsonl`）；
+- **钱**：`dsh-context-slimmer/tools/session-cost-audit.mjs`，或本仓库 `tools/` 下的
+  `session-health.mjs` / `recount-miss.mjs` / `today-turns.mjs`（先看**断点数与断点税**，
+  再看总账 —— 实测断点税常占未命中的 66%~87%）；
+- **质**：固定任务集 A/B。agentic 基准**未观察到退化**（短任务 8/8、长轨迹 3/3），
+  但任务规模仍小于真实长会话 ⇒ 强断言要等更长轨迹。
 
-> **一条与"调参"无关但更重要的判据**：只要 `cacheReadTokens / (cacheReadTokens + inputTokens)`
-> 保持在 99% 量级且每步命中量按新增量平稳递增，就说明前缀没被打断 ——
-> 这比"省了多少"更能说明健康度。
-
+**排障顺序**（按"能瞬间打穿账单"的程度）：
+① 搜索风暴（`web_search` 一次请求 = 服务端最多 5 个模型回合，其 usage **不进会话日志**）；
+② 子代理递归扇出（前缀不共享、缓存零复用）；③ 缓存 TTL 过期后的整份重算（隔夜/隔天回来）；
+④ 压缩断点；⑤ 工具结果体量（读进来的大内容此后每步随 payload 重发）。
