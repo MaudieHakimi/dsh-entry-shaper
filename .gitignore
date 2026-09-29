@@ -7,3 +7,6 @@ test/.tmp/
 # 鍩哄噯浜х墿锛堜复鏃惰緭鍑猴紝涓嶅叆搴擄級
 bench-out*.txt
 bench/agentic/.work/
+
+# examples/compose-demo.mjs 的临时产物
+examples/.compose-demo.*

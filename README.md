@@ -28,6 +28,7 @@
 - [配置](#配置)
 - [三种挂载方式](#三种挂载方式)
 - [统一协议：一切外部塑形都走同一套 I/O 约定](#统一协议一切外部塑形都走同一套-io-约定)
+  - [链式组合：七条性质（全部实测）](#链式组合七条性质全部实测)
 - [栈护栏](#栈护栏)
 - [实测数据](#实测数据)
 - [现状与限制](#现状与限制)
@@ -35,7 +36,6 @@
 - [文档](#文档)
 - [开发](#开发)
 - [许可](#许可)
-
 ## 问题：压缩为什么常常是亏的
 
 DSH 的 `compaction` 在**出口**改历史：把已发送的区间换成摘要检查点。这有效，但每一刀都会
@@ -309,6 +309,53 @@ OpenAI 兼容端点，都通过同一套信封与返回规则接入 —— 这�
 op 可任意链式组合，**可以是 async**，统一受 `opTimeoutMs`（默认 8s）约束：超时或抛错
 ⇒ **只跳过该 op**、保留上一步结果（fail-open）—— 最坏情况是"没省到"，绝不会挂住会话。
 未知 op 名同样被跳过（拼错名字不会让整条链失效）。
+
+### 链式组合：七条性质（全部实测）
+
+**线性可组合性**的意思是：每个 op 都是 `文本 → 文本`（或 `→ null`），
+**前一个的返回值就是后一个的入参**，而 op 的**来源完全无关**。内核里只有一个载体 ——
+`applyOps` 的局部变量 `out`：
+
+```js
+let out = text
+for (const op of ops) {
+  const produced = await withTimeout(fn(out, op, ctx), op.timeoutMs ?? ctx.opTimeoutMs ?? 8000)
+  out = produced
+  if (out === null || out === undefined) return null   // ① 立即终止整条链
+}
+return out
+```
+
+| # | 性质 | 实测 |
+|---|---|---|
+| 1 | **线性**：前一个的输出即后一个的输入 | `'a-b-c'` 经 `[replace(-→+), toUpperCase, replace(+→\|)]` ⇒ `"A\|B+C"` |
+| 2 | **异构混排**：纯函数 / 本地进程 / HTTP / 进程内 可插在任何位置 | `[head, exec(python), http, inline.regex, truncate]` ⇒ `"原始文本[llm]尾巴"` |
+| 3 | **逐 op fail-open**：一个坏掉不毁整条链 | `[A, exec(不存在的命令), AB, ABC]` ⇒ `"ABC"`（日志：`op exec 失败，跳过`） |
+| 4 | **逐 op 超时**：慢 op 被跳过，其余照常 | `[http(挂起, timeoutMs:50), inline]` ⇒ 后续 op 的结果正常返回 |
+| 5 | **提前终止**：返回 `null` ⇒ 整条链立即结束 | `[stub, drop, 不应出现]` ⇒ `null`（第三个 op 根本没执行） |
+| 6 | **逐 op 缓存**：纯 op 不缓存，其余各自缓存 | 同一输入跑两次，结果**逐字节相同**且真实 HTTP 只调用 **1 次** ⇒ 这就是前缀稳定的根据 |
+| 7 | **逐 op 覆盖**：同 op 名可在链上多次出现、各带参数 | `[head(6), tail(3), truncate(30)]` 作用于 `一二三四五六七八九十` ⇒ `"四五六"` |
+
+`timeoutMs` / `cache` 也可以**每个 op 单独写**。
+
+**最实用的一条结论：换实现不动架构。** 同一个位置可以是纯函数、子进程、本地 LLM 或云端 ——
+`policy` 里只改那**一个**对象。例如把默认的决策句抽取升级为"本地 LLM 语义压缩"：
+
+```jsonc
+// 之前
+"reasoning": { "ops": [{ "op": "extract", "maxChars": 240 }] }
+// 之后（其余一切照旧：缓存、超时、fail-open、代理链路）
+"reasoning": { "ops": [{ "op": "http", "baseURL": "http://127.0.0.1:11434/v1",
+                         "model": "qwen2.5:7b", "system": "压成 3 行要点。", "timeoutMs": 3000 }] }
+```
+
+⚠️ 两个实测发现的细节：
+- **`inline.regex` 默认只替换第一处**，要全局替换需显式加 `"flags": "g"`；
+- 直接调用导出的 `applyOps`（不经 `apply()`）时，`inline.code` 需要你自备
+  `ctx.compileInline`（插件运行时由 `apply()` 提供）。
+
+上面七条可以自己跑一遍复现：`node examples/compose-demo.mjs`（会真实启动一个 python
+子进程；无法启动时 fail-open 跳过该 op，其余性质照常验证）。
 
 ### 接自己的算法：三条路怎么选
 

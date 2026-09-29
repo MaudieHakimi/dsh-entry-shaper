@@ -53,6 +53,33 @@
 ⚠️ 注入**函数**需要 patch 出现 `config:` 行 ⇒ 不可热挂载。
 想两者都要就用 `inline.code`（函数体**源码字符串**，可写进热配置文件）。
 
+### 2.1 组合语义（`applyOps` 的契约）
+
+**唯一载体是局部变量 `out`**：每个 op 读它、写它 ⇒ 线性串联，无隐藏状态：
+
+```js
+let out = text
+for (const op of ops) {
+  out = await withTimeout(fn(out, op, ctx), op.timeoutMs ?? ctx.opTimeoutMs ?? 8000)
+  if (out === null || out === undefined) return null   // 立即终止整链
+}
+return out
+```
+
+| 保证 | 含义 | 实现位置 |
+|---|---|---|
+| 线性 | op 数组顺序即执行顺序；每个 op 只见上一步的输出 | `for` + `out` |
+| 来源无关 | 只要签名是 `(text, op, ctx) => string\|null`，纯函数 / `exec` / `http` / `inline` / 注入函数都可插在任何位置 | `OPS[op.op] ?? DEPRECATED_OPS[op.op]`（或 `op.__fn`） |
+| 失败隔离 | 单个 op 抛错只跳过它、保留上一步结果 | 逐 op `try/catch` |
+| 超时隔离 | `timeoutMs` 可**逐 op**覆盖全局 `opTimeoutMs` | `withTimeout`（⚠️ 定时器**不得 `unref()`**：无其它 handle 的进程会提前退出、超时不触发，实测踩过） |
+| 提前终止 | 返回 `null` / `undefined` ⇒ 整链立即返回 `null`（= 整块删除） | `return null` |
+| 缓存独立 | 每个 op 各自算键、各自命中；`cache: false` 可关单个 | `provablyPure` 判据 |
+| 参数独立 | 同名 op 可在链上出现多次、各带参数 | 每次迭代重新解析 `op` |
+
+⇒ **换实现不动架构**：`policy.<类别>.ops` 里的**一个对象**换成另一种传输方式即可，
+缓存、超时、fail-open、代理链路全部照旧。七条性质的实跑验证见 README
+「链式组合：七条性质」。
+
 ## 3. 类别与理由
 
 | 类别 | 来源 | 默认 op | 说明 |
