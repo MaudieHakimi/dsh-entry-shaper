@@ -56,8 +56,9 @@ node --check index.js
 node test/run-all.mjs
 node -e "JSON.parse(require('fs').readFileSync('package.json','utf8'))"   # 元文件可解析
 node -e "import('./index.js').then(m=>console.log(Object.keys(m).sort().join(', ')))"  # 导出面
-# patch 仍是纯 insert（可热挂载）：
-node -e "import('file:///C:/Users/CjyPi/.dsh/profiles/web/node_modules/dshmarket/lib/hot.js').then(async m=>{const fs=await import('node:fs');console.log(m.parseSimplePatch(fs.readFileSync('./cordis.patch.yml','utf8'))===null?'❌ 不可热挂载':'✅ 纯 insert')})"
+# patch 仍是纯 insert（可热挂载）。用 dshmarket 自己的解析器判定 ——
+# 路径换成你 profile 里的 dshmarket；DSH_HOME 默认是 ~/.dsh
+node -e "const p=process.env.DSH_HOME||require('node:os').homedir()+'/.dsh';import('file:///'+p.replace(/\\\\/g,'/')+'/profiles/web/node_modules/dshmarket/lib/hot.js').then(async m=>{const fs=await import('node:fs');console.log(m.parseSimplePatch(fs.readFileSync('./cordis.patch.yml','utf8'))===null?'❌ 不可热挂载':'✅ 纯 insert')})"
 ```
 
 > 顺带确认：`package.json` 的 `dsh.bundle.patch` 仍指向 `./cordis.patch.yml`
