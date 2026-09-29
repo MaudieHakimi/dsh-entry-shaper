@@ -193,8 +193,9 @@ const DEFAULTS = {
   },
   // 兼容旧配置：reasoningMode 仍可用，会被折算成 policy.reasoning.ops（显式 policy 优先）
   reasoningMode: undefined,
-  // 非纯 op（summarize / python）的结果缓存：保证同一输入在多次出网之间结果一致
-  // （否则重算结果一变，payload 前缀改变 ⇒ 断点税）。纯 op 不进缓存。
+  // 不可证明为纯的 op（exec / http / inline.code / 自定义注入）的结果缓存：
+  // 保证同一输入在多次出网之间结果一致（否则重算结果一变，payload 前缀改变 ⇒ 断点税）。
+  // 能证明是纯函数的 op（keep/extract/…）不进缓存 —— 见 applyOps 的 provablyPure。
   cache: {
     enabled: true,
     path: DEFAULT_CACHE,
@@ -906,11 +907,11 @@ export function apply(ctx, config = {}) {
   /**
    * 交给 op 的上下文：可注入 fetch/spawn（便于测试），LLM 凭据与脱敏也走这里。
    *
-   * ⚠️ 注意可热配置的边界：`llm` / `redact` / `fetch` / `spawn` **只能从 patch 的
-   * `config:` 传入**（函数与凭据无法写进 JSON 配置文件）⇒ 用到 `summarize` + 自定义凭据
-   * 或脱敏时，就必须放弃"patch 纯 insert"⇒ 放弃热挂载（改回重启生效）。
-   * 只想用内置 op（含指向你自己脚本/端点的 `python` / `summarize`）则完全不必：
-   * 那些参数都在热配置文件里。
+   * ⚠️ 注意可热配置的边界：`ctx.llm` / `ctx.redact` / `ctx.fetch` / `ctx.spawn`
+   * **只能从 patch 的 `config:` 传入**（函数与凭据无法写进 JSON 配置文件）⇒ 一旦用到它们，
+   * 就必须放弃"patch 纯 insert"⇒ 放弃热挂载（改回重启生效）。
+   * 只想用内置 op（含指向你自己命令/端点的 `exec` / `http`）则完全不必：
+   * 那些参数都在热配置文件里（这才是推荐用法）。
    */
   const opCache = createOpCache(cfg, log)
   /** `inline.code` 的编译缓存（按源码串缓存，改源码即失效）。 */
