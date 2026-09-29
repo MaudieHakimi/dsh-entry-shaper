@@ -543,6 +543,67 @@ test('统一协议 exec：python 自动带上 PYTHONIOENCODING=utf-8（Windows �
   assert.equal(calls[3].opts.env, undefined, '非 python 命令不加这个变量')
 })
 
+/**
+ * 在一个**干净的 node 子进程**里跑一段 ESM 源码，返回 { code, stdout, stderr }。
+ * 用途：有些缺陷只在"没有其它 handle 让事件循环活着"的进程里才暴露
+ *（例：超时定时器被 `unref()` ⇒ 进程提前退出），测试运行器里测不出来。
+ * 沙箱不允许 spawn 时返回 null（调用方自行降级）。
+ * @param source - 要执行的 ESM 源码（可用顶层 await）
+ * @returns {Promise<{code:number, stdout:string, stderr:string}|null>}
+ */
+async function runInChildProcess(source) {
+  try {
+    const { spawnSync } = await import('node:child_process')
+    const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs')
+    const { tmpdir } = await import('node:os')
+    const dir = mkdtempSync(join(tmpdir(), 'shaper-child-'))
+    const file = join(dir, 'probe.mjs')
+    writeFileSync(file, source, 'utf8')
+    const r = spawnSync(process.execPath, [file], { encoding: 'utf8', timeout: 15000 })
+    rmSync(dir, { recursive: true, force: true })
+    if (r.error !== undefined && r.error !== null) return null
+    return { code: r.status ?? -1, stdout: (r.stdout ?? '').trim(), stderr: r.stderr ?? '' }
+  } catch {
+    return null
+  }
+}
+
+test('超时护栏：定时器不得 unref（否则"该超时时不超时"）', async () => {
+  // 回归用例。曾经对超时定时器调用 `unref()`：本意是"别阻止进程退出"，代价却是
+  // 若进程没有别的 handle 让事件循环活着，进程会直接退出、promise 永不 settle
+  //（实测：退出码 13 + `Warning: Detected unsettled top-level await`）。
+  //
+  // ⚠️ **这个 bug 在进程内测不出来** —— 测试运行器本身让事件循环活着，unref 的定时器
+  // 照样会触发（我第一版就是这么写错的：撤掉修复后它仍然通过 ⇒ 一条假测试）。
+  // 所以真正有用的判据是"**在没有其它 handle 的干净子进程里**能不能拿到超时结果"。
+  const child = await runInChildProcess(`
+    import { applyOps } from ${JSON.stringify(new URL('../index.js', import.meta.url).href)}
+    const out = await applyOps('原始', [
+      { op: 'http', baseURL: 'http://x/v1', timeoutMs: 40 },
+      { op: 'inline', use: 'regex', pattern: '原始', template: '继续' },
+    ], { fetch: () => new Promise(() => {}), kind: 'r', log: () => {} })
+    process.stdout.write(String(out))
+  `)
+  if (child === null) {
+    // 沙箱不允许 spawn：退化为行为断言（弱），并明确标注
+    const out = await applyOps('原始', [
+      { op: 'http', baseURL: 'http://x/v1', timeoutMs: 40 },
+      { op: 'inline', use: 'regex', pattern: '原始', template: '继续' },
+    ], { fetch: () => new Promise(() => {}), kind: 'r', log: () => {} })
+    assert.equal(out, '继续', '（沙箱降级模式）超时后应继续执行后续 op')
+    return
+  }
+  assert.equal(child.code, 0, `子进程应正常退出（unref 会让它在超时前就退出）。stderr=${child.stderr.slice(0, 200)}`)
+  assert.equal(child.stdout, '继续', `子进程应拿到超时后的结果。stdout=${JSON.stringify(child.stdout)}`)
+
+  // 反向判据：op 正常完成时定时器要被清掉，否则进程会被它多留整个超时时长。
+  const quick = Date.now()
+  const ok = await applyOps('x', [{ op: 'http', baseURL: 'http://x/v1', timeoutMs: 60000 }],
+    { fetch: async () => ({ ok: true, status: 200, text: async () => 'done' }), kind: 'r', log: () => {} })
+  assert.equal(ok, 'done')
+  assert.ok(Date.now() - quick < 1000, 'op 完成时应清掉定时器（否则会挂住整个超时时长）')
+})
+
 test('未知 op 被跳过（fail-open）', async () => {
   assert.equal(await applyOps('hello', [{ op: 'no-such-op' }, { op: 'stub' }]), '[reasoning omitted: 5 chars]')
   assert.equal(await applyOps('hello', [{ op: 'drop' }]), null)

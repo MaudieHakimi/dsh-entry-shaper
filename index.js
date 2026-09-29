@@ -624,16 +624,25 @@ export async function applyOps(text, ops, ctx = {}) {
   return out
 }
 
-/** 超时护栏：op（尤其 LLM / 外部进程）不能把会话挂住。 */
+/**
+ * 超时护栏：op（尤其 LLM / 外部进程）不能把会话挂住。
+ *
+ * ⚠️ 这里**不能**对定时器 `unref()`（曾经这么写过，是错的）：
+ * `unref` 换来的"不阻止进程退出"，代价是"**该超时时不超时**" —— 若本进程没有别的
+ * handle 让事件循环活着（纯脚本调用 `applyOps`），进程会直接退出、promise 永不 settle
+ * （实测：退出码 13 + `Warning: Detected unsettled top-level await`）。
+ * 正确做法：定时器保持引用（保证一定会触发），**并在 op 结算时清掉它**
+ * （这样它也不会在 op 已完成之后把进程多留 `ms` 毫秒）。
+ */
 function withTimeout(promise, ms) {
   if (!Number.isFinite(ms) || ms <= 0) return promise
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => {
-      const t = setTimeout(() => reject(new Error(`op 超时（${ms}ms）`)), ms)
-      if (typeof t.unref === 'function') t.unref()
-    }),
-  ])
+  let timer
+  const guard = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`op 超时（${ms}ms）`)), ms)
+  })
+  // 谁先结算都要清掉定时器：防止"op 早就完成了，进程还被这个 timer 多留一会儿"
+  const clear = () => clearTimeout(timer)
+  return Promise.race([promise, guard]).finally(clear)
 }
 
 /** 决策句识别（确定性、零成本）：只按句式挑，不按位置截断。 */
