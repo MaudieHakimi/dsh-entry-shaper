@@ -1,8 +1,18 @@
 # 贡献指南
 
+## 来源声明
+
+**本仓库的全部源码（`index.js`、测试、基准、文档与工具脚本）完全由 DeepSeek-V4.1-Flash 生成**，
+人类负责提需求、做取舍与验收。因此接受贡献时有两条特殊要求：
+
+1. **事实性错误按 bug 处理** —— 文档/注释与代码不符、引用的源码行号过期、实测数字不可复现，
+   都请直接开 issue 或提 PR，不要当作"文档小问题"放过（这个项目里最贵的几次坑都是这类）；
+2. **改动仍要遵守本文件的规则** —— 尤其是「修复要证伪」与「凡有统计/告警的路径都要有
+   读日志文件的用例」两条，它们正是为了防"AI 写出了看起来对、实际没生效的代码"。
+
 ## 开发环境
 
-- Node.js ≥ 20（用到 `structuredClone`、`Array.prototype.at`、`node:zlib` zstd 无关）
+- Node.js ≥ 20（用到 `structuredClone`、`Array.prototype.at`；`tools/` 里读会话日志用到 `node:zlib` 的 zstd）
 - 无需构建：插件是纯 ESM，`index.js` 直接可加载
 - 无需依赖：`dependencies` 为空，`peerDependencies` 仅声明 `@deepseek-ai/cordis`
 
