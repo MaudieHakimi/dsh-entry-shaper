@@ -221,6 +221,27 @@ test('抽取：空输入返回空串', () => {
   assert.equal(extractReasoning(undefined, 100), '')
 })
 
+// 回归：曾经的 extract 无条件加 `[reasoning extract: N chars omitted] ` 前缀（约 37~39 字符），
+// 于是**任何短于约 279 字符的输入都被撑大**（实测 10/20/…/258 全部 +37）。
+// 撑大是净亏：更多出网字符，还可能触发断点税。判据必须是"最终是否比原文短"。
+test('抽取：短块不撑大（不比原文短就原样返回）', async () => {
+  const { OPS } = await import('../index.js')
+  const short = 'I will patch a.txt now.'
+  assert.equal(OPS.extract(short, { op: 'extract', maxChars: 240 }), short,
+    '短块必须原样返回（加前缀会变长）')
+  // 边界：前缀约 37~39 字符 ⇒ ~279 字符以下一定不该带前缀
+  for (const n of [1, 5, 40, 120, 240, 258, 278]) {
+    const text = 'x'.repeat(n)
+    const out = OPS.extract(text, { op: 'extract', maxChars: 240 })
+    assert.ok(out.length <= text.length, `${n} 字符的块不该变长（实际 ${out.length}）`)
+  }
+  // 反向：够长的块仍必须真的变短并带计数前缀（否则是"修过头"，塑形等于没做）
+  const long = `${'Exploring options. '.repeat(40)}I will patch a.txt now.`
+  const shaped = OPS.extract(long, { op: 'extract', maxChars: 240 })
+  assert.ok(shaped.length < long.length, '长块必须真的更短')
+  assert.ok(shaped.startsWith('[reasoning extract:'), '长块仍带省略计数前缀')
+})
+
 test('extract 模式：reasoning 换成"抽取 + 省略计数"，字段仍在', async () => {
   const { handlers, appends, session } = setup({ reasoningMode: 'extract', extractMaxChars: 60 })
   emit(handlers, session, makeEvent({
@@ -662,9 +683,10 @@ test('op 组合：全 keep 时不产生任何事件（不做无谓替换）', as
 
 test('流过滤：推理 chunk 被攒起、只吐出一个经 op 处理的 chunk', async () => {
   const { streamListener } = setupStream()
+  // 推理块必须**够长**（塑形后确实比原文短）才会加省略计数前缀 —— 见
+  // 「extract：短块不撑大」那条用例。这里攒出的是一段长推理，走的是正常路径。
   const out = await runStream(streamListener, [
-    { type: 'reasoning', text: 'Exploring ' },
-    { type: 'reasoning', text: 'many options. ' },
+    { type: 'reasoning', text: `${'Exploring many options and weighing tradeoffs. '.repeat(8)}` },
     { type: 'reasoning', text: 'I will patch a.txt now.' },
     { type: 'text', text: 'answer' },
     { type: 'finish', reason: { kind: 'stop' } },
@@ -672,8 +694,19 @@ test('流过滤：推理 chunk 被攒起、只吐出一个经 op 处理的 chunk
   assert.equal(out.length, 3, '还原成 3 个 chunk：reasoning + text + finish')
   assert.equal(out[0].type, 'reasoning', '推理字段必须仍在（否则工具回路会 400）')
   assert.ok(out[0].text.startsWith('[reasoning extract:'), '默认走 extract')
+  assert.ok(out[0].text.length < 400, '塑形后必须真的更短')
   assert.equal(out[1].type, 'text')
   assert.equal(out[2].type, 'finish')
+})
+
+test('流过滤：短推理块不撑大（不加会变长的省略计数前缀）', async () => {
+  const { streamListener } = setupStream()
+  const out = await runStream(streamListener, [
+    { type: 'reasoning', text: 'I will patch a.txt now.' },
+    { type: 'text', text: 'answer' },
+  ])
+  assert.equal(out[0].type, 'reasoning', '字段仍在')
+  assert.equal(out[0].text, 'I will patch a.txt now.', '短块原样透传：加前缀会净增字节')
 })
 
 test('流过滤：stub 模式把推理换成短桩', async () => {
@@ -1259,4 +1292,56 @@ test('无 seq 的事件被跳过（不是日志事件）', async () => {
   emit(handlers, session, makeEvent({ seq: undefined }))
   await settle()
   assert.equal(appends.length, 0)
+})
+
+// ── 运行时路径的缓存判据（公开 API 测不到的那段）──
+//
+// 回归：`resolveOps` 会把策略里的**内置** op 也解析成 `{...op, __fn: fn}`
+// （为了让公开 API `applyOps` 只认内置表）。而 provablyPure 原来写成
+// `op.__fn === undefined && PURE_OPS.has(op.op)` ⇒ 运行时路径下 __fn 永远存在
+// ⇒ **纯 op 全部被当成非纯 op 缓存**。实测代价：日志被 `op extract 缓存命中` 刷屏
+// （当日 34,596 行里 34,583 行是它），缓存文件里堆满可复现的 extract 结果。
+//
+// 关键：上面「缓存：纯 op 不进缓存」那条用 **applyOps** 直呼（没有 __fn）⇒ 一直是绿的，
+// 所以这个 bug 能活下来。判据必须认**实现身份**，用真实运行时的装配来测。
+test('缓存：运行时路径下，内置纯 op 也不进缓存（__fn 是"已解析"不是"自定义"）', async () => {
+  caseNo += 1
+  const cachePath = join(TMP, `rt-cache-${caseNo}.jsonl`)
+  rmSync(cachePath, { force: true })
+  const { handlers, session } = setup({
+    cache: { enabled: true, path: cachePath },
+    policy: {
+      reasoning: { ops: [{ op: 'extract', maxChars: 240 }] },
+      toolResult: { ops: [{ op: 'keep' }] },
+      toolArgs: { ops: [{ op: 'keep' }] },
+      assistantText: { ops: [{ op: 'keep' }] },
+    },
+  })
+  // 走真实事件入口（插件运行时自己装配 op 上下文与缓存）
+  emit(handlers, session, makeEvent())
+  await settle()
+  emit(handlers, session, makeEvent())
+  await settle()
+  assert.equal(existsSync(cachePath), false,
+    '内置 extract 是可复现纯函数 ⇒ 不该写缓存文件（写了就是 __fn 判据把内置当成了自定义）')
+})
+
+test('缓存：运行时路径下，自定义注入的 op 仍然进缓存（不能修过头）', async () => {
+  caseNo += 1
+  const cachePath = join(TMP, `rt-custom-${caseNo}.jsonl`)
+  rmSync(cachePath, { force: true })
+  const { handlers, session } = setup({
+    cache: { enabled: true, path: cachePath },
+    ops: { myOp: (text) => `custom:${text}` },
+    policy: {
+      reasoning: { ops: [{ op: 'myOp' }] },
+      toolResult: { ops: [{ op: 'keep' }] },
+      toolArgs: { ops: [{ op: 'keep' }] },
+      assistantText: { ops: [{ op: 'keep' }] },
+    },
+  })
+  emit(handlers, session, makeEvent())
+  await settle()
+  assert.equal(existsSync(cachePath), true,
+    '自定义 op 无法证明是纯函数 ⇒ 必须进缓存（否则结果漂移会打断前缀）')
 })

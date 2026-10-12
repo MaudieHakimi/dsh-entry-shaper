@@ -239,7 +239,16 @@ export const OPS = {
     // 默认带"省略计数"前缀：基准实测用的就是这个形态（测的必须等于跑的）。
     // 想关掉就写 { op: 'extract', marker: false }。
     if (op.marker === false || picked === '') return picked
-    return `[reasoning extract: ${Math.max(0, raw.length - picked.length)} chars omitted] ${picked}`
+    const marked = `[reasoning extract: ${Math.max(0, raw.length - picked.length)} chars omitted] ${picked}`
+    /**
+     * 短块护栏：前缀本身有固定长度（实测 37~39 字符），所以**短输入一定被撑大**。
+     * 实测（maxChars=240）：10~240 字符的输入全部 +37，258 → +20，直到 ~279 字符才转正。
+     * 注意"省略 0 字符"的和其余短块一样会涨 —— 判据不是"省了没有"，而是**最终是否比原文短**。
+     * 撑大是**净亏**（更多出网字符，且塑形器本身还可能触发断点税），所以这里退回原文。
+     * 返回 raw 而不是 picked：加前缀前的 picked 可能比 raw 短，但"比原文短"这件事
+     * 若对 raw 都不成立，pick 原文才是唯一不涨的形态。
+     */
+    return marked.length < raw.length ? marked : raw
   },
   head: (text, op) => (text ?? '').slice(0, op.chars ?? 512),
   tail: (text, op) => (text ?? '').slice(-(op.chars ?? 512)),
@@ -606,7 +615,15 @@ export async function applyOps(text, ops, ctx = {}) {
        *   ⇒ 付断点税（比多占几 KB 磁盘贵得多，所以**宁可多缓存**）。
        */
       const inlineCode = op.op === 'inline' && (op.use ?? 'stdout') === 'code'
-      const provablyPure = op.__fn === undefined && PURE_OPS.has(op.op) && !inlineCode
+      /**
+       * `__fn` 只代表"**注入**了实现"，不代表"实现是自定义的"：
+       * resolveOps 会把策略里的**内置** op 也解析成 `__fn`（为了让公开 API 只认内置表），
+       * 于是内置的 extract 也带着 __fn ⇒ provablyPure 恒为 false ⇒ 纯 op 全被缓存。
+       * 实测代价：日志里 op extract 缓存命中刷屏（当日 34,596 行里 34,583 行是它），
+       * 缓存文件里躺着一堆可复现的 extract 结果。判据要认**实现身份**，不是有没有 __fn。
+       */
+      const isBuiltin = fn === OPS[op.op] || fn === DEPRECATED_OPS[op.op]
+      const provablyPure = (op.__fn === undefined || isBuiltin) && PURE_OPS.has(op.op) && !inlineCode
       const useCache = Boolean(ctx.cache?.enabled) && op.cache !== false && typeof out === 'string'
         && !provablyPure
       const key = useCache ? ctx.cache.keyOf(op, out, ctx) : null
