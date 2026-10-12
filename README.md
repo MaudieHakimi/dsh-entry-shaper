@@ -583,6 +583,7 @@ N=17 的配对样本不足以做强断言。
 | 模型选择器里看不到代理 | ① 之前踩过：`listModels()` 未把 `provider` 改盖成本路由 id ⇒ 整组被判 `INVALID_CATALOG` 而不显示（已修 0.9.3）；② **重启后的短暂窗口**：`ctx.get('llm')` 在 `apply()` 时尚未就绪，提供方要等注册成功才出现（1.0.1 起启动期主动重试，日志有 `proxy 等待 llm 服务就绪` / `WARN …仍未注册成功`）。自查：`POST /api/llm.models` 看 `failures`；选择器目录**按会话缓存**，刷新页面再看 |
 | 日志有 `proxy 注册失败：adapter.xxx is not a function` | 适配器缺运行时要求的成员。运行时调用 `providerInfo` / `providerRetryPolicy` / `listModels` / `resolveModel` / `prepareCall` / `stream` **全部**（`packages/llm/llm/src/index.ts`）。已修（0.9.2） |
 | 热挂载后行为没变 | 热挂载**不刷新模块缓存** ⇒ 代码改动必须重启；只有配置与开关能热改 |
+| **改了源码、重启了、行为仍是旧的** | `dsh plugin --profile web add "file:…"` 装的是**物理副本**，不是符号链接（实测：`node_modules/dsh-entry-shaper` 既非 symlink，`realpath` 也不等于源码目录）。⇒ **只改源码目录永远不会生效**，必须把改动**复制进** `<profile>\node_modules\dsh-entry-shaper\`（或重新 `dsh plugin … add`）。自查三行：比对两处 `index.js` 的 SHA256、看 `package.json` 的 `version`、看插件日志最后一条 `applied` 的时间戳是否晚于进程启动时间 |
 | 看得到省了多少吗 | 日志里 `proxy-shape #n chars=A→B（累计 …）`（前 3 次 + 之后每 20 次一行） |
 | 想验证出网内容 | 装 `dsh-llm-tap` 看 `~/.dsh-llm-tap/llm-tap.jsonl`，或读本插件日志的字符统计 |
 | 账单突然打穿 | **先怀疑搜索与子代理扇出，不是本插件**：`web_search` 一次请求 = 服务端最多 5 个模型回合（`max_uses` 默认 5）且这些轮次的 usage **不进会话日志**；子代理又会各自开子代理 ⇒ 并行前缀不共享、缓存零复用。见[§ 1b](#1b-成本结构实测钱到底花在哪2026-09-多会话审计) |
