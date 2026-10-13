@@ -74,7 +74,7 @@ wire 级塑形对同一条旧消息**每次请求都会重算**
 用 `exec` 起一个 node 脚本：
 
 ```js
-// diversifier.mjs —— 用法：{ "op":"exec", "command":"node", "script":"D:/tools/diversifier.mjs" }
+// diversifier.mjs —— 你自己保存的脚本；配置里：{ "op":"exec", "command":"node", "script":"<脚本路径>" }
 import { createHash } from 'node:crypto'
 
 const VARIANTS = ['Let me', 'I will', 'Next,', 'Now I', 'I should', 'Going to', 'Time to', 'Then I']
@@ -134,8 +134,8 @@ B > A 且 C ≈ A  ⇒ 甲成立（重复致病）⇒ 多样性确实有用
 
 ```jsonc
 "ops": [
-  { "op": "extract", "maxChars": 240 },     // 先抽决策句
-  { "op": "exec", "command": "node", "script": "D:/tools/diversifier.mjs" }  // 再多样化
+  { "op": "extract", "maxChars": 240 },                          // 先抽决策句
+  { "op": "exec", "command": "node", "script": "<脚本路径>" }     // 再多样化
 ]
 ```
 

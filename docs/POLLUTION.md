@@ -26,8 +26,8 @@
 
 ### 2.1 出网侧：历史推理确实是塑形形态
 
-只读 `~/.dsh-llm-tap/llm-tap.jsonl` 尾部（**该文件可达 20+ GB，务必用 offset 尾部读，
-绝不整读**）：
+用**出网抓包/统计插件**（监听 `llm/stream`，记录请求 messages 与响应 chunk）读其日志尾部
+（**该类日志可达 20+ GB，务必用 offset 尾部读，绝不整读**）：
 
 ```
 provider=deepseek-official  messages=631  inputChars=855989
@@ -36,8 +36,8 @@ provider=deepseek-official  messages=631  inputChars=855989
 
 ### 2.2 回流侧：模型在**逐字生成**这个格式 ★
 
-判据：`llm-tap` 记的是**细粒度流**（单次调用的 reasoning 分片数 65~3391，
-说明 tap 在过滤器外层 ⇒ 看到的是真实模型输出）。取输出以 `[reasoning extract:`
+判据：抓包插件记的是**细粒度流**（单次调用的 reasoning 分片数 65~3391，
+说明它位于过滤器**外层** ⇒ 看到的是真实模型输出）。取输出以 `[reasoning extract:`
 开头的调用，其分片为：
 
 ```
@@ -144,9 +144,9 @@ node tools/original.mjs "<shaped 文本>" # 查回原文
 
 | ❌ 不要 | ✅ 要 |
 |---|---|
-| 只看会话里的 `assistant/message` | 看**出网** messages（llm-tap 的 `kind=request`） |
+| 只看会话里的 `assistant/message` | 看**出网** messages（抓包记录的 `kind=request`） |
 | 把 `reasoning-chunks` 的 `texts` 直接拼接判断"正文含关键词" | 那是**分片**记录，拼接会造**假阳性** |
-| 认为"tap 看到的输出 = 模型原始输出" | 先确认中间件顺序：**分片数多**（几十~几千）才说明 tap 在外层 |
-| 整读 llm-tap.jsonl | 该文件可达 **20+ GB**，必须 offset 尾部读 |
+| 认为"抓包看到的输出 = 模型原始输出" | 先确认中间件顺序：**分片数多**（几十~几千）才说明抓包插件在外层 |
+| 整读抓包日志 | 该文件可达 **20+ GB**，必须 offset 尾部读 |
 
 **本轮我在这个坑里栽了三次**，都是"字段/顺序假设错误 ⇒ 得出反向结论"。

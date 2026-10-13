@@ -8,7 +8,34 @@
 
 ## [1.0.6] — 2026-10-13
 
-**寄存表的增长控制（1.0.5 上线后由真实运行数据暴露）。**
+**寄存表的增长控制（1.0.5 上线后由真实运行数据暴露）+ 文档去本地化。**
+
+### 文档：把"作者本机专属"的引用改成通用描述
+
+公开仓库里出现了两个**只有作者本机才装**的插件名，对读者是纯噪音（他们装不到、
+也搜不到）。已全部替换为**能力描述 + 可选示例**：
+
+| 原写法 | 改为 |
+|---|---|
+| `dsh-context-slimmer`（上下文压缩插件） | **上下文压缩类插件 / `compaction` 服务供应商** |
+| `dsh-llm-tap`（出网抓包插件） | **出网抓包/统计插件**（监听 `llm/stream`，记录请求 messages 与响应 chunk） |
+| `~/.dsh-llm-tap/llm-tap.jsonl` | 抓包日志（未指定路径；工具全部接受路径参数） |
+
+覆盖 13 个文件：`README.md`、`SECURITY.md`、`CONTRIBUTING.md`、`index.js`（两处注释）、
+`tools/README.md`、`tools/verify-wire-shaping.mjs`，以及 `docs/` 下
+`PIPELINE` / `POLLUTION` / `PROCESSING` / `FILLER-WORDS` / `VERIFICATION` / `USAGE-LEDGER`。
+
+顺带清掉同类问题：
+- README 体检示例里的**作者工作区名**（`--D-DSH~0020Desktop--`）→ 改为
+  `<工作区>` / `<会话>` 占位，并补两行"怎么先列出来"的命令；
+- `docs/USAGE-LEDGER.md` 的会话表把**具体会话 ID 与"HOI4 mod"这类标签**隐去
+  （改为"会话 A/B/C"）—— 它们对结论没有意义，只会暴露作者本机环境；
+- `examples/diverse-filler.md` 里的 `D:/tools/diversifier.mjs` → `<脚本路径>`。
+
+> 保留的（**不是**泄漏）：`--D-xxx--` 是 DSH 自身的工作区目录编码规则（任何用户都有）；
+> 匿名会话 UUID 作为证据引用是必要的（可复现），且不带任何可识别的标签。
+
+### 增长控制
 
 1.0.5 引入原文寄存表时只做了"换轮清空"，**上线后实测发现它仍在涨**：
 
@@ -49,7 +76,7 @@
 | 3 | README 索引写 tools **11 个**（实际 12） | 改为 **12 个**，并补"原文回溯" |
 | 4 | README 索引写 `CONTRIBUTING.md` **6 条硬规则**（实际 12） | 改为 **12 条** |
 | 5 | README 的 op 表写 `extract` 的 `marker` 默认 **true**（1.0.5 起已是 false） | 改为 **false** 并标注"会污染模型" |
-| 6 | **两处悬空引用**：`docs/PIPELINE.md` → `tools/probe-reasoning-passback.mjs`、`docs/PROCESSING.md` → `dsh-context-slimmer/tools/session-cost-audit.mjs`；**两个文件都不存在** | 前者改指实际的 `bench/passback-rule.mjs`；后者移除并列出本仓库覆盖该功能的脚本 |
+| 6 | **两处悬空引用**：`docs/PIPELINE.md` → `tools/probe-reasoning-passback.mjs`、`docs/PROCESSING.md` → 某个**本地插件目录**下的 `tools/session-cost-audit.mjs`；**两个文件都不存在** | 前者改指实际的 `bench/passback-rule.mjs`；后者移除并列出本仓库覆盖该功能的脚本 |
 
 另修正两处**与实测不符**的旧宣称（同 1.0.5 的"保留原文"问题）：
 `docs/OFFICIAL-STACK.md` 的两处"保留原文"、`docs/PROCESSING.md` 的 M6 里程碑条目。
@@ -112,7 +139,7 @@
   `[reasoning extract: N chars omitted] ` 前缀。该前缀随 assistant 消息进入**之后每一次
   请求**（`surface.ts:deriveEventMessage()` 对 `assistant/message` 原样返回），
   模型把它当成**自己思维链的一部分**并**逐字继续生成**它。
-  **wire 级取证**：llm-tap 的输出流分片为 `"[" "reason" "ing" " extract" ":" …`，
+  **wire 级取证**：出网抓包插件记到的输出流分片为 `"[" "reason" "ing" " extract" ":" …`，
   即模型是**主动写出**这个格式的，不是被动携带 ⇒ 自我强化。
   出网侧同样验证：历史推理 **179 塑形 / 12 原文**（94% 是塑形形态）。
   ⇒ 讽刺之处：本插件本为去掉 "Hmm" 这类自我强化的填充噪音，却自己引入了一个
@@ -135,7 +162,7 @@
     清空点放在 `onEvent` 的 `turn/start`（不放 `handleEvent`：熔断/关闭期间换轮也要清）。
 - **`tools/original.mjs`**：原文回溯工具（`--list` / `--stats` / 查一条）。
 - **`docs/POLLUTION.md`**：污染的完整取证、根治方案、以及"排查这类问题时的正确判据"
-  （含本轮栽过的三个坑：分片拼接假阳性、中间件顺序、llm-tap 不可整读）。
+  （含本轮栽过的三个坑：分片拼接假阳性、中间件顺序、抓包日志不可整读）。
 
 ### 回归用例（87 → 92）
 
@@ -242,7 +269,7 @@
   `today-tools.mjs`（按工具统计当日工具结果体量）、`cost-all-sessions.mjs`、
   `today-usage.mjs`、`why-miss.mjs`、`sao-fanout.mjs`（子代理扇出时间线）、
   `sao-search-attrib.mjs`（搜索归属）、`pair-wire-shaping.mjs` / `verify-wire-shaping.mjs`
-  （从 llm-tap 配对取证塑形前后的出网字符数）。全部**已逐个冒烟测试通过**。
+  （从**出网抓包日志**配对取证塑形前后的出网字符数）。全部**已逐个冒烟测试通过**。
   之前这些散落在本机临时目录里、文档却引用了它们 ⇒ 引用悬空；现正式入库。
 
 ### Changed
@@ -460,7 +487,7 @@
 
 - **`proxy-shape` 自证日志**：每次代理塑形都记账（前 3 次 + 之后每 20 次一行），
   格式 `proxy-shape #n chars=A→B（本次 −X%；累计 A→B = −Y%）`。
-  动机：在此之前"到底省了多少"只能靠第三方抓包（`dsh-llm-tap`）看，用户装了插件
+  动机：在此之前"到底省了多少"只能靠**出网抓包插件**看，用户装了插件
   却无法自证；现在**看一眼自己的日志就够**。日志只记字符数，不记内容 ✓。
   `createProxyAdapter()` 相应新增 `onShaped({ before, after })` 回调（可注入，便于测试）。
 - `README.md` **全文重写**：修掉三处已经过期的内容 ——

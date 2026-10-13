@@ -348,8 +348,8 @@ export const OPS = {
      * 默认**不加**任何前缀 —— 这是实测得出的安全默认。
      *
      * 原因（wire 级取证，见 docs/POLLUTION.md）：前缀会随 assistant 消息进入之后的
-     * 每一次请求，模型把它当成**自己思维链的一部分**并逐字继续生成它。llm-tap 的
-     * 输出流分片证明模型是"逐字写出" `[reasoning extract: N chars omitted]` 的
+     * 每一次请求，模型把它当成**自己思维链的一部分**并逐字继续生成它。出网抓包插件
+     * 记到的输出流分片证明模型是"逐字写出" `[reasoning extract: N chars omitted]` 的
      * （分片为 "[" "reason" "ing" " extract" ":" …），而不是被动携带 ⇒ 自我强化。
      *
      * 这与本插件的初衷正好相反：它本是为了去掉 "Hmm" 这类自我强化的填充噪音，
@@ -1254,7 +1254,7 @@ export function apply(ctx, config = {}) {
    *     （⇒ 不能含它自己；主仓库注释里早写着 "`[seq, ...chunkSeqs]` 仍被拒"）。
    *   两条校验器互相矛盾 ⇒ 这条路是死的。
    *
-   * 于是推理改在 `llm/stream` 中间件里处理（`dsh-llm-tap` 证明这条通道可用）：
+   * 于是推理改在 `llm/stream` 中间件里处理（出网抓包插件已证明这条通道可用）：
    * 把流里的 reasoning chunk **先攒起来**，在推理结束（遇到第一个非 reasoning chunk 或流结束）时
    * **只吐出一个**经 op 链处理的 reasoning chunk ⇒ 推理**根本没进会话**，无需替换、无校验器冲突；
    * 而 payload 里仍有 reasoning_content（字段必须在，否则工具回路会被 API 400）。

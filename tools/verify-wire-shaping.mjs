@@ -1,6 +1,7 @@
-// 从 llm-tap 的巨型 jsonl 尾部取样，验证「wire 级塑形是否真的生效」。
-// 只读文件末尾若干 MB（文件已 6.7GB，不能整读）。
-// 关键：本插件代理会**转调 llm.stream()** ⇒ tap 挂在内层，记录的就是**塑形后**的出网请求 ✓
+// 从**出网抓包/统计插件**（监听 llm/stream，记录请求 messages 与响应 chunk）所写的
+// 巨型 jsonl 尾部取样，验证「wire 级塑形是否真的生效」。
+// 只读文件末尾若干 MB（该类日志可达 20+ GB，不能整读）。
+// 关键：本插件代理会**转调 llm.stream()** ⇒ 抓包插件挂在内层，记录的就是**塑形后**的出网请求 ✓
 import { openSync, readSync, closeSync, statSync } from 'node:fs'
 
 const file = process.argv[2]

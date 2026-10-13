@@ -152,12 +152,10 @@ return out
 - **健康度（最重要）**：`cacheReadTokens / (cacheReadTokens + inputTokens)` 保持在 99% 量级，
   且**每步命中量按新增量平稳递增**（说明前缀在延长、没被重建）。这比"省了多少"更能说明问题；
 - **量**：本插件日志 `proxy-shape #n chars=A→B（累计 …）`（前 3 次 + 之后每 20 次）；
-  要核对**真实出网内容**再用 `dsh-llm-tap`（`~/.dsh-llm-tap/llm-tap.jsonl`）；
+  要核对**真实出网内容**再用**出网抓包插件**（记录 `llm/stream` 请求与 chunk 的插件）；
 - **钱**：本仓库 `tools/` 下的 `session-health.mjs` / `recount-miss.mjs` / `today-turns.mjs`
   / `cost-all-sessions.mjs` / `today-usage.mjs`（先看**断点数与断点税**，
   再看总账 —— 实测断点税常占未命中的 66%~87%）；
-  > ⚠️ 原先此处还指向 `dsh-context-slimmer/tools/session-cost-audit.mjs`，
-  > 但**该文件在本机不存在**（悬空引用）⇒ 已移除，功能由上面几个脚本覆盖。
 - **质**：固定任务集 A/B。agentic 基准**未观察到退化**（短任务 8/8、长轨迹 3/3），
   但任务规模仍小于真实长会话 ⇒ 强断言要等更长轨迹。
 

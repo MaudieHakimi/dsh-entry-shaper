@@ -1,6 +1,6 @@
 # tools/ — 会话体检与排障脚本
 
-全部**只读**：只解析 `session.jsonl.zstd`、llm-tap 日志，或插件的侧路寄存表，
+全部**只读**：只解析 `session.jsonl.zstd`、**出网抓包日志**，或插件的侧路寄存表，
 不修改任何数据、不发网络请求。**零依赖**，只用 Node 内置模块。
 
 ## 它们回答什么问题
@@ -16,14 +16,15 @@
 | 某次"整份未命中"之前发生了什么 | `why-miss.mjs` | `node tools/why-miss.mjs "<session.jsonl.zstd>" [--at=<seq>] [--n=25]` |
 | 那个工作区为什么开了 9 个会话？ | `sao-fanout.mjs` | `node tools/sao-fanout.mjs "<工作区目录>"` |
 | 今天的搜索请求是谁发起的 | `sao-search-attrib.mjs` | `node tools/sao-search-attrib.mjs "<sessions 根目录>"` |
-| 出网 payload 真的被塑形了吗（配对取证） | `pair-wire-shaping.mjs` | `node tools/pair-wire-shaping.mjs "<llm-tap.jsonl>" [字节数]` |
-| 同上，但按内容类别统计 | `verify-wire-shaping.mjs` | `node tools/verify-wire-shaping.mjs "<llm-tap.jsonl>" [条数] [字节数]` |
+| 出网 payload 真的被塑形了吗（配对取证） | `pair-wire-shaping.mjs` | `node tools/pair-wire-shaping.mjs "<抓包日志.jsonl>" [字节数]` |
+| 同上，但按内容类别统计 | `verify-wire-shaping.mjs` | `node tools/verify-wire-shaping.mjs "<抓包日志.jsonl>" [条数] [字节数]` |
 | **把塑形后的推理换回原文**（回溯） | `original.mjs` | `node tools/original.mjs --stats` / `--list` / `"<shaped 文本>"` |
 
 > `original.mjs` 读的是**插件写的侧路寄存表** `~/.dsh-entry-shaper.originals.jsonl`
 > （不是只读会话）—— 它是唯一能还原推理原文的地方，**每轮清空**、只覆盖当前轮。
-> ⚠️ `llm-tap.jsonl` 可达 **20+ GB**，用 `pair-wire-shaping.mjs` / `verify-wire-shaping.mjs`
-> 时务必只读尾部（它们已支持传入字节数参数，内部用 offset 读，不会整读）。
+> ⚠️ **出网抓包日志可达 20+ GB**（记录每次请求的完整 messages），
+> 用 `pair-wire-shaping.mjs` / `verify-wire-shaping.mjs` 时务必只读尾部
+> （它们已支持传入字节数参数，内部用 offset 读，不会整读）。
 >
 > ⚠️ **除 `original.mjs` 外，其余脚本都要求传入路径参数**；不传会直接抛
 > `ERR_INVALID_ARG_TYPE` 堆栈（不是友好的用法提示）。用法见上表第三列。

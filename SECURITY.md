@@ -16,7 +16,7 @@
 
 ## 它不做什么
 
-- **不接管 `compaction` 服务**（与官方 `dsh-compaction-basic`、`dsh-context-slimmer` 共存）；
+- **不接管 `compaction` 服务**（与官方 `dsh-compaction-basic` 及任何第三方上下文压缩插件共存）；
 - **不改写已发送的内容**（那会打断前缀缓存并付全价税 —— 这正是本插件要避免的事）；
 - **不自己发 HTTP**：代理把请求交回 `llm` 服务 ⇒ **凭据由 llm 服务按上游 provider id 解析**
   （`~/.dsh/.credentials.yaml`），本插件不读取、不存储、不转发任何 API key；

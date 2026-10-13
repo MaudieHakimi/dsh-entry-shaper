@@ -265,7 +265,7 @@ DSH 的 `compaction-basic` 在**出口**改历史：把已发送的区间换成�
 
 | ✅ 它是 | ❌ 它不是 |
 |---|---|
-| **代理 provider**：`llm.registerAdapter()` 注册一个新路由，转调上游 | 不接管 `compaction` 服务（可与官方 `dsh-compaction-basic`、`dsh-context-slimmer` 共存） |
+| **代理 provider**：`llm.registerAdapter()` 注册一个新路由，转调上游 | 不接管 `compaction` 服务（可与官方 `dsh-compaction-basic` 及任何第三方上下文压缩插件共存） |
 | 塑形**只作用在"之后要被发出的那一份"**上：保留推理过程的增益、去掉它进入上下文的代价 | 不改写**已发送**的内容（那是"出口压缩"的领域，要付断点税） |
 | 塑形**逐消息确定**：纯 op，或不可证明为纯的 op 走内容哈希缓存 ⇒ 同一条旧消息每次出网形态一致 ⇒ 前缀稳定 | 在**代理通道**上不自己发 HTTP（见下）—— 它把请求交回 `llm` 服务，凭据仍由服务按上游 id 解析 ⇒ **不需要新 API key** |
 | 失败即放行（fail-open）：任何异常只写日志，请求照常发 | 日志不记录消息内容（只记字符数、策略名与计数） |
@@ -621,7 +621,8 @@ return out
 
 ### 1. wire 级塑形：−40.1%，缓存命中 99.3%
 
-用 `dsh-llm-tap` 抓到的真实出网请求，把**外层**（`deepseek-shaped`，塑形前）与
+用一个**出网抓包/统计插件**（任何监听 `llm/stream`、记录每次请求的 messages 与响应 chunk
+的插件都行）抓到的真实出网请求，把**外层**（`deepseek-shaped`，塑形前）与
 **内层**（`deepseek-official`，真正出网）按 `callId` 配对（`messageCount` 完全相同 ⇒ 同一次调用）：
 
 | | 字符数 |
@@ -737,7 +738,7 @@ N=17 的配对样本不足以做强断言。
 | 热挂载后行为没变 | 热挂载**不刷新模块缓存** ⇒ 代码改动必须重启；只有配置与开关能热改 |
 | **改了源码、重启了、行为仍是旧的** | `dsh plugin --profile web add "file:…"` 装的是**物理副本**，不是符号链接（实测：`node_modules/dsh-entry-shaper` 既非 symlink，`realpath` 也不等于源码目录）。⇒ **只改源码目录永远不会生效**，必须把改动**复制进** `<profile>\node_modules\dsh-entry-shaper\`（或重新 `dsh plugin … add`）。自查三行：比对两处 `index.js` 的 SHA256、看 `package.json` 的 `version`、看插件日志最后一条 `applied` 的时间戳是否晚于进程启动时间 |
 | 看得到省了多少吗 | 日志里 `proxy-shape #n chars=A→B（累计 …）`（前 3 次 + 之后每 20 次一行） |
-| 想验证出网内容 | 装 `dsh-llm-tap` 看 `~/.dsh-llm-tap/llm-tap.jsonl`，或读本插件日志的字符统计 |
+| 想验证出网内容 | 装一个**出网抓包/统计插件**（监听 `llm/stream`，记录请求 messages 与响应 chunk），或直接读本插件日志的字符统计 |
 | 账单突然打穿 | **先怀疑搜索与子代理扇出，不是本插件**：`web_search` 一次请求 = 服务端最多 5 个模型回合（`max_uses` 默认 5）且这些轮次的 usage **不进会话日志**；子代理又会各自开子代理 ⇒ 并行前缀不共享、缓存零复用。见[§ 1b](#1b-成本结构实测钱到底花在哪2026-09-多会话审计) |
 | 突然行为异常 | 建 `~/.dsh-entry-shaper.OFF` 立停（原样转发），再排查 |
 
@@ -779,7 +780,11 @@ node bench/agentic/runner.mjs --max-rounds=20                  # agentic 基准�
 ### 体检自己的会话（只读、零依赖）
 
 ```powershell
-node tools/session-health.mjs "$env:USERPROFILE\.dsh\sessions\--D-DSH~0020Desktop--\<会话>\session.jsonl.zstd"
+# 先列出一个工作区下的会话，再把路径喂给体检脚本
+Get-ChildItem "$env:USERPROFILE\.dsh\sessions" -Directory | Select-Object -First 5   # 工作区
+Get-ChildItem "$env:USERPROFILE\.dsh\sessions\<工作区>" -Directory                    # 会话
+
+node tools/session-health.mjs "$env:USERPROFILE\.dsh\sessions\<工作区>\<会话>\session.jsonl.zstd"
 node tools/recount-miss.mjs  "$env:USERPROFILE\.dsh\sessions"          # 多时间口径 + 逐小时
 node tools/today-turns.mjs   "$env:USERPROFILE\.dsh\sessions"          # 按回合看成本
 node tools/today-tools.mjs   "$env:USERPROFILE\.dsh\sessions"          # 哪个工具把上下文撑大

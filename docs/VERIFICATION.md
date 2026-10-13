@@ -94,7 +94,8 @@ case 'assistant/message': {
 - 被遮蔽的往往是巨大的旧工具结果 ⇒ 我的分母虚高 ⇒ 省幅虚高。
 
 ⇒ 这两个脚本的重放数字**不可用**，已在文件头标注。正确做法是完整实现
-`Session.deriveMessages()` 的 fold（含 replace 遮蔽），或直接从 `llm-tap` 抓真实出网请求。
+`Session.deriveMessages()` 的 fold（含 replace 遮蔽），或直接用**出网抓包插件**
+抓真实出网请求再核对。
 
 ## 五、可信 vs 不可信（结论）
 
