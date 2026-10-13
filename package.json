@@ -1,6 +1,6 @@
 {
   "name": "dsh-entry-shaper",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "description": "入口塑造（payload shaping）：按类别给会话元素排 op 链（reasoning / toolResult / toolArgs / assistantText），在元素被首次发送前定型；代理通道在 wire 层塑形 ⇒ 前缀单调、零断点税。塑形结果不带任何标记（标记会污染模型，见 docs/POLLUTION.md），推理原文可在侧路寄存表里回溯。",
   "type": "module",
   "main": "index.js",

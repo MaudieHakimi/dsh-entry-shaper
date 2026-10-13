@@ -203,16 +203,30 @@ export function createOriginalsStore(cfg, log) {
   const enabled = (cfg.originals?.enabled ?? cfg.originalsEnabled) !== false
   const path = cfg.originals?.path ?? cfg.originalsPath ?? DEFAULT_ORIGINALS
   const maxEntryChars = cfg.originals?.maxEntryChars ?? 262144
-  const stats = { stored: 0, skipped: 0, purged: 0 }
+  const maxBytes = cfg.originals?.maxBytes ?? 4 * 1024 * 1024
+  const stats = { stored: 0, skipped: 0, purged: 0, deduped: 0, capped: 0 }
+  /** 本轮已写过的键（**内存去重**，见下文 put 的说明）。 */
+  const seen = new Set()
   let turn = null
 
-  /** 换轮即清空：保证文件大小 ≈ 当前轮的推理原文量，而非整个会话。 */
+  /** 清空文件与内存索引。 */
   const purge = () => {
     try {
       writeFileSync(path, '', 'utf8')
       stats.purged += 1
     } catch { /* 清空失败不影响会话 */ }
+    seen.clear()
   }
+
+  /**
+   * 启动即清空一次。
+   *
+   * 为什么需要（实测踩到的洞）：只在"换轮"时清空，会漏掉**进程重启**这一情形 ——
+   * 新进程的 `turn` 初值是 null ⇒ 首次 `turn/start` 时 `turn !== next` 为假 ⇒
+   * **不触发清空**，上一个进程遗留的内容就永久躺在那里。
+   * 实测：重启后文件从 22:09 的旧条目一路涨到 2.3 MB，且一条 `purged` 日志都没有。
+   */
+  if (enabled) purge()
 
   return {
     enabled,
@@ -224,21 +238,40 @@ export function createOriginalsStore(cfg, log) {
       if (turn !== null && next !== turn) {
         purge()
         if (stats.purged <= 3 || stats.purged % 50 === 0) {
-          log(`originals purged（换轮 ${turn} → ${next}；已存 ${stats.stored} 条）`)
+          log(`originals purged（换轮 ${turn} → ${next}；已存 ${stats.stored} 条，去重 ${stats.deduped}）`)
         }
       }
       turn = next
     },
-    /** 存一条：shaped → original。同一 shaped 只存一次（单射，重复即等价）。 */
+    /**
+     * 存一条：shaped → original。
+     *
+     * ⚠️ **必须去重**（实测踩到的洞）：wire 级塑形对**同一条旧消息每次请求都会重算**
+     * ⇒ 同一条推理会以**逐字节相同**的 shaped 反复到达这里。不去重就会反复写盘：
+     * 实测 1039 条里 823 条是重复（79%），14 分钟把文件写到 1.1 MB 且持续增长。
+     * 因为塑形是**单射**（同 shaped ⇒ 同 original），重复写入没有任何信息增益 ⇒ 直接跳过。
+     */
     put(shaped, original) {
       if (!enabled) return
       if (typeof shaped !== 'string' || typeof original !== 'string') return
       if (shaped === original || shaped.length === 0) return
-      if (original.length > maxEntryChars) { stats.skipped += 1; return }
       const k = createHash('sha256').update(shaped).digest('hex')
+      if (seen.has(k)) { stats.deduped += 1; return }
+      if (original.length > maxEntryChars) { stats.skipped += 1; return }
+      seen.add(k)
       try {
         appendFileSync(path, `${JSON.stringify({ k, v: original, t: Date.now() })}\n`, 'utf8')
         stats.stored += 1
+        // 兜底：即使去重失效（例如单轮内推理块极多），也不让它无限增长
+        if (statSync(path).size > maxBytes) {
+          stats.capped += 1
+          purge()
+          // 清空后把当前这条补回去，保持"最近一条可查"
+          seen.add(k)
+          appendFileSync(path, `${JSON.stringify({ k, v: original, t: Date.now() })}\n`, 'utf8')
+          stats.stored += 1
+          log(`originals capped at ${maxBytes} bytes ⇒ purged（本轮已存 ${stats.stored} 条）`)
+        }
       } catch { /* 写失败不影响会话 */ }
     },
     /** 查回原文（供工具/测试使用）。 */

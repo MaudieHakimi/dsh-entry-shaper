@@ -1360,16 +1360,52 @@ test('原文寄存：换轮即清空（防硬盘随会话线性增长）', async
   rmSync(origPath, { force: true })
   const { createOriginalsStore } = await import('../index.js')
   const store = createOriginalsStore({ originals: { path: origPath, enabled: true } }, () => {})
+  // 注意：构造时**就会清空一次**（防"进程重启后旧内容永久残留"，实测踩到）。
+  // 所以这里用相对基线断言，而不是写死绝对次数。
+  const purgedAtStart = store.stats.purged
+  assert.equal(purgedAtStart, 1, '构造时必须先清空一次（否则重启后上轮内容会残留）')
   store.beginTurn(1)
   store.put('shaped-A', 'original-A')
   assert.equal(readFileSync(origPath, 'utf8').trim().split('\n').length, 1)
   store.beginTurn(2)   // 换轮 ⇒ 清空
   assert.equal(readFileSync(origPath, 'utf8'), '', '换轮后必须清空')
-  assert.equal(store.stats.purged, 1)
+  assert.equal(store.stats.purged, purgedAtStart + 1, '换轮应恰好再清空一次')
   // 同一轮内不清空
   store.put('shaped-B', 'original-B')
   store.beginTurn(2)
   assert.equal(readFileSync(origPath, 'utf8').trim().split('\n').length, 1, '同一轮不清空')
+})
+
+// 回归：wire 级塑形对**同一条旧消息每次请求都会重算** ⇒ 同一 (shaped, original) 会反复到达。
+// 不去重就会反复写盘：实测 1039 条里 823 条重复（79%），14 分钟写到 1.1 MB 且持续增长。
+test('原文寄存：同一对 (shaped, original) 只写一次（去重，防反复写盘）', async () => {
+  caseNo += 1
+  const origPath = join(TMP, `orig-dedup-${caseNo}.jsonl`)
+  rmSync(origPath, { force: true })
+  const { createOriginalsStore } = await import('../index.js')
+  const store = createOriginalsStore({ originals: { path: origPath, enabled: true } }, () => {})
+  store.beginTurn(1)
+  for (let i = 0; i < 50; i++) store.put('same-shaped', 'same-original')
+  assert.equal(readFileSync(origPath, 'utf8').trim().split('\n').length, 1, '重复不得重复写盘')
+  assert.equal(store.stats.stored, 1)
+  assert.equal(store.stats.deduped, 49, '其余 49 次应记为去重')
+  // 不同的 shaped 仍要写
+  store.put('other-shaped', 'other-original')
+  assert.equal(readFileSync(origPath, 'utf8').trim().split('\n').length, 2)
+})
+
+// 回归：即使去重失效（极端情况），也不能无限增长 —— 必须有大小兜底。
+test('原文寄存：超过 maxBytes 自动清空（最后一道防线）', async () => {
+  caseNo += 1
+  const origPath = join(TMP, `orig-cap-${caseNo}.jsonl`)
+  rmSync(origPath, { force: true })
+  const { createOriginalsStore } = await import('../index.js')
+  const store = createOriginalsStore({ originals: { path: origPath, enabled: true, maxBytes: 4096 } }, () => {})
+  store.beginTurn(1)
+  for (let i = 0; i < 60; i++) store.put(`shaped-${i}`, 'x'.repeat(400))
+  const size = readFileSync(origPath, 'utf8').length
+  assert.ok(store.stats.capped > 0, '应触发过兜底清空')
+  assert.ok(size < 4096 * 3, `文件应被兜底压住（实得 ${size}）`)
 })
 
 test('原文寄存：默认关闭时完全不写盘', async () => {
