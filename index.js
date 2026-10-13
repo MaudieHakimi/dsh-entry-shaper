@@ -28,7 +28,7 @@
 //   * 免重启熔断：存在 ~/.dsh-entry-shaper.OFF 即停手；也可在 patch 里 enabled: false
 //   * 绝不抛错进事件派发链（全部 try/catch）
 
-import { appendFileSync, existsSync, readFileSync, renameSync, statSync } from 'node:fs'
+import { appendFileSync, existsSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -38,6 +38,8 @@ export const name = 'dsh-entry-shaper'
 const DEFAULT_LOG = join(homedir(), '.dsh-entry-shaper.log')
 const DEFAULT_OFF = join(homedir(), '.dsh-entry-shaper.OFF')
 const DEFAULT_CACHE = join(homedir(), '.dsh-entry-shaper.cache.jsonl')
+// 原文寄存表（侧路，**绝不回灌模型**）：shaped 文本 → 原文。见 docs/POLLUTION.md。
+const DEFAULT_ORIGINALS = join(homedir(), '.dsh-entry-shaper.originals.jsonl')
 // 热配置：patch 里**不能**放 config（dshmarket 的 hot.js:295 明确：含配置行的 patch
 // 无法热挂载，只能重启生效）⇒ 所有可调项放这个文件，运行时按 mtime 热读。
 const DEFAULT_CONFIG = join(homedir(), '.dsh-entry-shaper.config.json')
@@ -181,9 +183,81 @@ export function createOpCache(cfg, log) {
   }
 }
 
+/**
+ * 原文寄存表（侧路审计）：`sha256(shaped) → 原文`。
+ *
+ * 为什么需要：`extract` 只留决策句 ⇒ 原文在会话里**永久消失**（推理不可回溯）。
+ * 但**绝不能**把原文塞回 payload —— 那等于取消塑形。所以走侧路：
+ * 需要回溯时用 `tools/original.mjs <shaped 文本>` 查。
+ *
+ * 两个设计决定（都来自实测）：
+ *  ① **按内容哈希为键**：塑形是单射（4872 个真实块 + 400 条极端构造样本实测：
+ *     撞键 0、最大一对多扇出 1）⇒ shaped 文本本身就能唯一定位原文，不需要额外键。
+ *     这也是被迫的：塑形发生在 `llm/stream` 中间件里，那一刻**还没有事件 seq**
+ *     （seq 在 append 时才分配）⇒ 没有稳定的顺序键可用。
+ *  ② **每轮清空**：寄存表只需覆盖"当前这一轮"，因为模型/用户回溯的总是刚发生的推理。
+ *     实测单轮原文峰值：均值 8K~37K 字符、最大 182K~272K 字符（≈0.3 MB）
+ *     ⇒ 峰值可控；若不清空则随会话线性增长，**硬盘会爆**。
+ */
+export function createOriginalsStore(cfg, log) {
+  const enabled = (cfg.originals?.enabled ?? cfg.originalsEnabled) !== false
+  const path = cfg.originals?.path ?? cfg.originalsPath ?? DEFAULT_ORIGINALS
+  const maxEntryChars = cfg.originals?.maxEntryChars ?? 262144
+  const stats = { stored: 0, skipped: 0, purged: 0 }
+  let turn = null
+
+  /** 换轮即清空：保证文件大小 ≈ 当前轮的推理原文量，而非整个会话。 */
+  const purge = () => {
+    try {
+      writeFileSync(path, '', 'utf8')
+      stats.purged += 1
+    } catch { /* 清空失败不影响会话 */ }
+  }
+
+  return {
+    enabled,
+    stats,
+    path,
+    /** 记一轮的开始；换轮就清空上一轮。 */
+    beginTurn(next) {
+      if (!enabled) return
+      if (turn !== null && next !== turn) {
+        purge()
+        if (stats.purged <= 3 || stats.purged % 50 === 0) {
+          log(`originals purged（换轮 ${turn} → ${next}；已存 ${stats.stored} 条）`)
+        }
+      }
+      turn = next
+    },
+    /** 存一条：shaped → original。同一 shaped 只存一次（单射，重复即等价）。 */
+    put(shaped, original) {
+      if (!enabled) return
+      if (typeof shaped !== 'string' || typeof original !== 'string') return
+      if (shaped === original || shaped.length === 0) return
+      if (original.length > maxEntryChars) { stats.skipped += 1; return }
+      const k = createHash('sha256').update(shaped).digest('hex')
+      try {
+        appendFileSync(path, `${JSON.stringify({ k, v: original, t: Date.now() })}\n`, 'utf8')
+        stats.stored += 1
+      } catch { /* 写失败不影响会话 */ }
+    },
+    /** 查回原文（供工具/测试使用）。 */
+    get(shaped) {
+      if (typeof shaped !== 'string') return undefined
+      const k = createHash('sha256').update(shaped).digest('hex')
+      try {
+        for (const line of readFileSync(path, 'utf8').split('\n')) {
+          if (line === '') continue
+          try { const rec = JSON.parse(line); if (rec?.k === k) return rec.v } catch { /* 坏行 */ }
+        }
+      } catch { /* 无文件 */ }
+      return undefined
+    },
+  }
+}
+
 const DEFAULTS = {
-  enabled: true,
-  // 是否**塑形推理**这一类（旧名 dropReasoning 仍兼容，见 mergeCfg）。
+  enabled: true,  // 是否**塑形推理**这一类（旧名 dropReasoning 仍兼容，见 mergeCfg）。
   // 它不是全局总闸：工具结果 / 工具参数 / 助手文本只看 enabled。
   // （旧版把整条事件链压在推理开关下 ⇒ 写 `dropReasoning:false` 会把 toolResult 塑形一起静默关掉。）
   shapeReasoning: true,
@@ -236,18 +310,27 @@ export const OPS = {
   extract: (text, op) => {
     const raw = text ?? ''
     const picked = extractReasoning(raw, op.maxChars ?? 240)
-    // 默认带"省略计数"前缀：基准实测用的就是这个形态（测的必须等于跑的）。
-    // 想关掉就写 { op: 'extract', marker: false }。
-    if (op.marker === false || picked === '') return picked
-    const marked = `[reasoning extract: ${Math.max(0, raw.length - picked.length)} chars omitted] ${picked}`
+    if (picked === '') return picked
     /**
-     * 短块护栏：前缀本身有固定长度（实测 37~39 字符），所以**短输入一定被撑大**。
-     * 实测（maxChars=240）：10~240 字符的输入全部 +37，258 → +20，直到 ~279 字符才转正。
-     * 注意"省略 0 字符"的和其余短块一样会涨 —— 判据不是"省了没有"，而是**最终是否比原文短**。
-     * 撑大是**净亏**（更多出网字符，且塑形器本身还可能触发断点税），所以这里退回原文。
-     * 返回 raw 而不是 picked：加前缀前的 picked 可能比 raw 短，但"比原文短"这件事
-     * 若对 raw 都不成立，pick 原文才是唯一不涨的形态。
+     * 默认**不加**任何前缀 —— 这是实测得出的安全默认。
+     *
+     * 原因（wire 级取证，见 docs/POLLUTION.md）：前缀会随 assistant 消息进入之后的
+     * 每一次请求，模型把它当成**自己思维链的一部分**并逐字继续生成它。llm-tap 的
+     * 输出流分片证明模型是"逐字写出" `[reasoning extract: N chars omitted]` 的
+     * （分片为 "[" "reason" "ing" " extract" ":" …），而不是被动携带 ⇒ 自我强化。
+     *
+     * 这与本插件的初衷正好相反：它本是为了去掉 "Hmm" 这类自我强化的填充噪音，
+     * 却自己引入了一个更规整的同类噪音（外部注入的格式比自然填充更难摆脱）。
+     *
+     * 顺带收益：每个块少 ~40 字符（实测 4872 个真实块，压缩率 92.11% → 93.72%）。
+     * 若确实需要人类审计"省略了多少"，请用 `{ op:'extract', marker:true }` 显式打开，
+     * 并自行承担污染风险；正常回溯请用侧路的原文寄存表（originals）。
      */
+    if (op.marker !== true) return picked
+    const marked = `[reasoning extract: ${Math.max(0, raw.length - picked.length)} chars omitted] ${picked}`
+    // 短块护栏：前缀本身有固定长度（实测 37~39 字符），所以**短输入一定被撑大**。
+    // 实测（maxChars=240）：10~240 字符的输入全部 +37，258 → +20，直到 ~279 字符才转正。
+    // 判据不是"省了没有"，而是**最终是否比原文短**；撑大是净亏，退回原文。
     return marked.length < raw.length ? marked : raw
   },
   head: (text, op) => (text ?? '').slice(0, op.chars ?? 512),
@@ -598,6 +681,8 @@ export const DEPRECATED_OPS = {
 export async function applyOps(text, ops, ctx = {}) {
   if (!Array.isArray(ops) || ops.length === 0) return text
   let out = text
+  // 进入 op 链时的原文（用于侧路寄存：链尾的形态 ↔ 链首的原文）
+  const entryText = typeof text === 'string' ? text : ''
   for (const op of ops) {
     // `op.__fn` 允许调用方注入自定义实现（插件运行时用它支持 `config.ops`）；
     // 直接使用导出 API 时只写 `{ op: 'exec', … }` 即可，仍然查内置表。
@@ -637,6 +722,16 @@ export async function applyOps(text, ops, ctx = {}) {
       }
       const produced = await withTimeout(Promise.resolve(fn(out, op, ctx)), timeout)
       if (useCache && typeof produced === 'string') ctx.cache.put(key, produced)
+      /**
+       * 侧路寄存：把"这一轮的原文 → 塑形结果"记进寄存表，供**回溯与审计**。
+       *
+       * 只在**推理**这一类上记（其他地方不丢信息，没必要占盘）。
+       * 注意寄存表**只写不读**：它永远不参与 messages 的构造，
+       * 因此不可能回灌模型 —— 这正是它与"把原文塞回 payload"的本质区别。
+       */
+      if (ctx.kind === 'reasoning' && typeof produced === 'string' && produced !== out) {
+        ctx.originals?.put(produced, entryText)
+      }
       out = produced
       if (out === null || out === undefined) return null
     } catch (error) {
@@ -945,6 +1040,8 @@ export function apply(ctx, config = {}) {
    * 那些参数都在热配置文件里（这才是推荐用法）。
    */
   const opCache = createOpCache(cfg, log)
+  /** 原文寄存表（侧路审计，只写不读 ⇒ 不可能回灌模型）。见 createOriginalsStore。 */
+  const originals = createOriginalsStore(cfg, log)
   /** `inline.code` 的编译缓存（按源码串缓存，改源码即失效）。 */
   const inlineCodeCache = new Map()
   const baseOpCtx = {
@@ -955,6 +1052,7 @@ export function apply(ctx, config = {}) {
     spawn: cfg.spawn,
     redact: cfg.redact,
     cache: opCache,
+    originals,
     compileInline: (body) => compileInline(body, inlineCodeCache),
     log,
   }
@@ -1194,6 +1292,20 @@ export function apply(ctx, config = {}) {
    *      可观测证据（若哪天看到它告警，说明时序假设被破坏，应立即停手排查）。
    */
   const onEvent = (session, event) => {
+    /**
+     * 换轮即清空原文寄存表。
+     *
+     * 为什么按轮：寄存表只需覆盖"刚发生的那一轮"（回溯/审计看的都是最近的推理）。
+     * 实测单轮原文峰值 0.2~0.3 MB ⇒ 清空后文件大小恒定在**当前轮**量级；
+     * 不清空则随会话线性增长（一个长会话的推理原文可达数百 MB），**硬盘会爆**。
+     *
+     * 放在这里（而不是 handleEvent 里）是因为：换轮事件可能在 cfg.enabled=false
+     * 或熔断期间照样到来，寄存表也必须跟着清 —— 否则"关掉插件"反而留下一个不再清空的
+     * 堆积文件。清空本身与塑形无关，纯粹是磁盘卫生。
+     */
+    if (event?.type === 'turn/start' && Number.isFinite(event?.data?.turn)) {
+      try { originals.beginTurn(event.data.turn) } catch { /* 不影响会话 */ }
+    }
     void handleEvent(session, event).catch((error) => {
       stats.failed += 1
       try { log(`HANDLER FAILED seq=${event?.seq} err=${error?.message ?? error}（fail-open）`) } catch { /* 忽略 */ }

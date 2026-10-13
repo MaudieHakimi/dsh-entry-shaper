@@ -40,7 +40,13 @@
 | 正常回合的未命中 | **1,148 ~ 4,140 token**（≈ 每步新增量 ⇒ 零断点） |
 | 正常回合成本 | **$0.019 ~ $0.038 / 回合** |
 
-取证方法见[§ 实测数据](#实测数据)；日志与界面**永远保留原文**。
+取证方法见[§ 实测数据](#实测数据)。
+
+> ⚠️ **"保留原文"的准确边界**（2026-10-13 修正，此前这里写的是"日志与界面**永远保留原文**"，与实测不符）：
+> 实测会话日志里**确实存在塑形形态的推理块**（`acde5be7` 2145 个推理块中 447 个带塑形痕迹），
+> 也就是说**原文不保证保留**。这与本插件的设计意图（wire 级塑形、不碰会话）不符，
+> 是**已知缺陷**，成因与取证见 [`docs/POLLUTION.md`](docs/POLLUTION.md)。
+> 受影响的原文可用**侧路寄存表**回溯：`node tools/original.mjs`（每轮清空，只覆盖当前轮）。
 
 ---
 
@@ -461,8 +467,11 @@ return out
 | 3 | 元素若已不在当前表面（被别人替换/被压缩覆盖）⇒ 放弃 | `session.surface.nodes` 成员检查 |
 | 4 | 异步 op 超时即跳过，并量"追加 → 定型"延迟 | `opTimeoutMs` + `lagWarnMs` |
 
-代理通道不依赖 1–4（它不碰会话），但继承"**确定性**"这一条：纯 op 天然确定，
-非纯 op 靠缓存兜住 ⇒ 同一输入永远同一形态。
+代理通道在**出网的那一份 messages 上**塑形（`shapeMessages()`），但**这不等于会话不被改动**：
+实测模型返回的推理 chunk 已是塑形形态，而 `agent-loop/src/agent.ts:348` 会把中间件之后的
+每个 chunk `session.append` 进会话 ⇒ **会话里存的也是塑形后的文本**。
+换句话说"不碰会话"这个说法**不准确**，见 [`docs/POLLUTION.md`](docs/POLLUTION.md)。
+它继承"**确定性**"这一条：纯 op 天然确定，非纯 op 靠缓存兜住 ⇒ 同一输入永远同一形态。
 
 ## 实测数据
 
@@ -568,7 +577,8 @@ N=17 的配对样本不足以做强断言。
 
 - **默认关闭**：本包默认 `enabled: false`，需要你确认可接受"模型只看得到推理精要"这一点；
 - **推理是有损的**：`extract` 只留决策句（默认 240 字符预算），探索与试错过程不进 payload
-  ⇒ 模型可能在长轨迹上重复劳动。**界面与日志永远保留原文**，所以审计不受影响；
+  ⇒ 模型可能在长轨迹上重复劳动。**原文可用侧路寄存表回溯**
+  （`node tools/original.mjs`，每轮清空、只覆盖当前轮 —— 见 [`docs/POLLUTION.md`](docs/POLLUTION.md)）；
   觉得太紧就换 `head`（保留真实开头）或放宽 `maxChars`（代价：省幅下降）；
 - **默认只塑形推理**：`toolResult` / `toolArgs` / `assistantText` 默认 `keep`。
   官方 `tool-result-pruner` 已在做工具结果剪枝，先别重复造轮子；
@@ -596,6 +606,9 @@ N=17 的配对样本不足以做强断言。
 | [`docs/OFFICIAL-STACK.md`](docs/OFFICIAL-STACK.md) | 官方三层（pruner / compaction / command-compact）的位置与阈值、一次 `/compact` 的实测账单、本插件的空位 |
 | [`docs/PIPELINE.md`](docs/PIPELINE.md) | 工作管道：总图、时序（含 harness 源码出处）、元素生命周期、降级路径、验收观测点 |
 | [`docs/PROCESSING.md`](docs/PROCESSING.md) | 处理层规范：统一协议、op 目录、里程碑与被否掉的方案 |
+| [`docs/POLLUTION.md`](docs/POLLUTION.md) | **塑形标记如何污染模型**：wire 级取证、根治方案（默认去前缀）、原文寄存表与每轮清空策略、排查这类问题时的正确判据 |
+| [`docs/VERIFICATION.md`](docs/VERIFICATION.md) | "省了多少"的独立核验：两路互不依赖的口径交叉验证、可信度分级、一次失败的重放尝试 |
+| [`docs/USAGE-LEDGER.md`](docs/USAGE-LEDGER.md) | 权威用量账本：费用结构、为何"命中率已到顶"、费用集中度与规模趋势 |
 | [`examples/custom-op.md`](examples/custom-op.md) | 接入自定义算法的五条路径 + 函数契约 + 热挂载取舍表 |
 | [`tools/README.md`](tools/README.md) | 会话体检与排障脚本（11 个，只读、零依赖）：命中率/断点/成本/搜索与子代理扇出定位 |
 | [`CHANGELOG.md`](CHANGELOG.md) | 变更记录（含被基准否掉的方案与踩过的坑） |

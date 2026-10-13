@@ -140,7 +140,11 @@ test('决策抽取（默认）：reasoning 换成"抽取 + 省略计数"，text/
   assert.equal(opts.surfaceOp.end, 570)
   assert.deepEqual(opts.sourceEventSeqs, [17, 18, 19, 20], 'provenance 必须原样沿用')
   assert.deepEqual(data.message.content.map((b) => b.type), ['reasoning', 'text', 'tool-call'])
-  assert.ok(data.message.content[0].text.startsWith('[reasoning extract:'), '默认走决策抽取')
+  // 默认形态**不带**任何前缀（前缀会污染模型，见 docs/POLLUTION.md）：
+  // 断言"被塑形"要认特征（抽到的决策句 + 变短），不能认前缀。
+  assert.ok(data.message.content[0].text.includes('I will patch a.txt now'), '默认走决策抽取（留下决策句）')
+  assert.ok(!data.message.content[0].text.includes('chars omitted'), '默认不带 omitted 前缀（避免污染模型）')
+  assert.ok(data.message.content[0].text.length < 200, '塑形后确实变短')
   assert.equal(data.message.content[2].arguments, '{"path":"a.txt"}', 'tool-call 原样保留')
 })
 
@@ -224,22 +228,41 @@ test('抽取：空输入返回空串', () => {
 // 回归：曾经的 extract 无条件加 `[reasoning extract: N chars omitted] ` 前缀（约 37~39 字符），
 // 于是**任何短于约 279 字符的输入都被撑大**（实测 10/20/…/258 全部 +37）。
 // 撑大是净亏：更多出网字符，还可能触发断点税。判据必须是"最终是否比原文短"。
-test('抽取：短块不撑大（不比原文短就原样返回）', async () => {
+//
+// 现在默认已**完全不带**前缀（前缀会污染模型，见 docs/POLLUTION.md），
+// 所以"撑大"从根本上消失；本用例改为守住"绝不比原文长"这个不变量。
+test('抽取：绝不比原文长（短块原样返回）', async () => {
   const { OPS } = await import('../index.js')
   const short = 'I will patch a.txt now.'
   assert.equal(OPS.extract(short, { op: 'extract', maxChars: 240 }), short,
-    '短块必须原样返回（加前缀会变长）')
-  // 边界：前缀约 37~39 字符 ⇒ ~279 字符以下一定不该带前缀
-  for (const n of [1, 5, 40, 120, 240, 258, 278]) {
+    '短块必须原样返回（不该被改写）')
+  // 全长度区间都不该变长
+  for (const n of [1, 5, 40, 120, 240, 258, 278, 279, 400, 2000]) {
     const text = 'x'.repeat(n)
     const out = OPS.extract(text, { op: 'extract', maxChars: 240 })
     assert.ok(out.length <= text.length, `${n} 字符的块不该变长（实际 ${out.length}）`)
   }
-  // 反向：够长的块仍必须真的变短并带计数前缀（否则是"修过头"，塑形等于没做）
+  // 反向：够长的块仍必须真的变短（否则是"修过头"，塑形等于没做）
   const long = `${'Exploring options. '.repeat(40)}I will patch a.txt now.`
   const shaped = OPS.extract(long, { op: 'extract', maxChars: 240 })
   assert.ok(shaped.length < long.length, '长块必须真的更短')
-  assert.ok(shaped.startsWith('[reasoning extract:'), '长块仍带省略计数前缀')
+  assert.ok(shaped.includes('I will patch a.txt now'), '决策句必须留下')
+  // 默认绝不引入任何"记账格式"字串 —— 它是污染源
+  assert.ok(!shaped.includes('chars omitted'), '默认不得带省略计数（会污染模型）')
+  assert.ok(!shaped.includes('reasoning extract'), '默认不得带 extract 标记（会污染模型）')
+})
+
+// 显式打开 marker 才带前缀（保留给"确实需要人类审计省略量"的场景，使用者自担污染风险）
+test('抽取：marker:true 才带省略计数前缀（非默认）', async () => {
+  const { OPS } = await import('../index.js')
+  const long = `${'Exploring options. '.repeat(40)}I will patch a.txt now.`
+  const marked = OPS.extract(long, { op: 'extract', maxChars: 240, marker: true })
+  assert.ok(marked.startsWith('[reasoning extract:'), '显式要求时才带前缀')
+  assert.ok(marked.length < long.length, '仍必须比原文短（短块护栏依旧生效）')
+  // 短块即使显式要求也不该被撑大
+  const short = 'I will patch a.txt now.'
+  assert.equal(OPS.extract(short, { op: 'extract', maxChars: 240, marker: true }), short,
+    '显式 marker 也不能让短块变长')
 })
 
 test('extract 模式：reasoning 换成"抽取 + 省略计数"，字段仍在', async () => {
@@ -255,8 +278,9 @@ test('extract 模式：reasoning 换成"抽取 + 省略计数"，字段仍在', 
   await settle()
   const reasoning = appends[0][1].message.content.find((b) => b.type === 'reasoning')
   assert.ok(reasoning, '字段必须仍在（缺字段会被 API 400）')
-  assert.ok(reasoning.text.startsWith('[reasoning extract:'), '带省略计数前缀')
   assert.ok(reasoning.text.includes('I will patch the parser now'), '含抽取到的决策句')
+  assert.ok(!reasoning.text.includes('chars omitted'), '默认不带省略计数（会污染模型）')
+  assert.ok(reasoning.text.length < 500, '塑形后确实变短')
   assert.deepEqual(appends[0][1].message.content.map((b) => b.type), ['reasoning', 'text', 'tool-call'])
 })
 
@@ -293,10 +317,17 @@ test('无 reasoning 的消息被跳过', async () => {
 // ── 处理层：op 组合 ──
 
 test('链式 op：extract → truncate 依次生效', async () => {
+  // 注意：这两个 op 的"是否触发"由**长度**决定，所以必须让 extract 的产出**仍长于**
+  // truncate 的阈值，否则 truncate 是空操作（链式语义上没错，但测不到它）。
+  // 历史教训：本条曾用 maxChars=500 的 extract —— 那时 extract 会加 ~40 字符前缀撑到
+  // 279+，恰好让 truncate 触发；前缀去掉后 extract 只留 26 字符 ⇒ truncate 不再触发。
+  // 也就是说**这条用例过去是靠前缀才通过的**，测的并不是"链式组合"。
   const text = `${'Exploring many options. '.repeat(20)}I will patch parse.js now.`
-  const out = await applyOps(text, [{ op: 'extract', maxChars: 500 }, { op: 'truncate', maxChars: 60 }])
+  const mid = await applyOps(text, [{ op: 'extract', maxChars: 500 }])
+  assert.ok(mid.length < text.length, '第一级：extract 让文本变短')
+  const out = await applyOps(text, [{ op: 'extract', maxChars: 500 }, { op: 'truncate', maxChars: 20 }])
   assert.ok(out.length <= 90, `链后应被截断（实得 ${out.length}）`)
-  assert.ok(out.includes('省略'), 'truncate 留下省略标记')
+  assert.ok(out.includes('省略'), 'truncate 留下省略标记（它是首尾保留，不丢信息结构）')
 })
 
 // ── 异步 op：LLM 调用 / 外部进程（都用注入的 mock，不真的出网或起进程）──
@@ -693,7 +724,7 @@ test('流过滤：推理 chunk 被攒起、只吐出一个经 op 处理的 chunk
   ])
   assert.equal(out.length, 3, '还原成 3 个 chunk：reasoning + text + finish')
   assert.equal(out[0].type, 'reasoning', '推理字段必须仍在（否则工具回路会 400）')
-  assert.ok(out[0].text.startsWith('[reasoning extract:'), '默认走 extract')
+  assert.ok(!out[0].text.includes('chars omitted'), '默认不带省略计数（会污染模型）')
   assert.ok(out[0].text.length < 400, '塑形后必须真的更短')
   assert.equal(out[1].type, 'text')
   assert.equal(out[2].type, 'finish')
@@ -940,7 +971,8 @@ test('shapeMessages：默认只塑形 reasoning，text/tool-call/tool-result/use
   const policy = { reasoning: { ops: [{ op: 'extract', maxChars: 60 }] }, toolResult: { ops: [{ op: 'keep' }] }, toolArgs: { ops: [{ op: 'keep' }] }, assistantText: { ops: [{ op: 'keep' }] } }
   const out = await shapeMessages([assistantMsg(), toolMsg(), userMsg()], policy, {})
   const assistant = out[0].content
-  assert.ok(assistant[0].text.startsWith('[reasoning extract:'), 'reasoning 被塑形')
+  assert.ok(assistant[0].text.length < assistantMsg().content[0].text.length, 'reasoning 被塑形（变短）')
+  assert.ok(!assistant[0].text.includes('chars omitted'), '默认不带省略计数（会污染模型）')
   assert.equal(assistant[1].text, 'answer', 'text 原样')
   assert.equal(assistant[2].arguments, '{"path":"a.txt"}', 'tool-call 参数原样')
   assert.equal(out[1].content[0].content[0].text.length, 300, 'tool-result 原样')
@@ -1292,6 +1324,96 @@ test('无 seq 的事件被跳过（不是日志事件）', async () => {
   emit(handlers, session, makeEvent({ seq: undefined }))
   await settle()
   assert.equal(appends.length, 0)
+})
+
+// ── 污染防护 + 原文寄存（见 docs/POLLUTION.md）──
+
+test('污染防护：默认塑形结果里不含任何"记账格式"字串', async () => {
+  // 这是本轮最重要的不变量：模型会把塑形器的记账标记当成自己的思维内容继续写
+  // （wire 级取证：输出分片为 "[" "reason" "ing" " extract" ":" …，是模型逐字生成的）。
+  const policy = { reasoning: { ops: [{ op: 'extract', maxChars: 240 }] }, toolResult: { ops: [{ op: 'keep' }] }, toolArgs: { ops: [{ op: 'keep' }] }, assistantText: { ops: [{ op: 'keep' }] } }
+  const long = `${'Exploring options and weighing tradeoffs. '.repeat(20)}I will patch a.txt now.`
+  const out = await shapeMessages([{ role: 'assistant', content: [{ type: 'reasoning', text: long }] }], policy, {})
+  const text = out[0].content[0].text
+  assert.ok(!/chars omitted|reasoning extract|reasoning omitted/i.test(text),
+    `默认输出不得含记账格式，实得：${JSON.stringify(text.slice(0, 80))}`)
+  assert.ok(text.includes('I will patch a.txt now'), '决策句仍在')
+})
+
+test('原文寄存：侧路记下 shaped→original，且只写不读（不可能回灌）', async () => {
+  caseNo += 1
+  const origPath = join(TMP, `orig-${caseNo}.jsonl`)
+  rmSync(origPath, { force: true })
+  const { createOriginalsStore, OPS: OpsTable } = await import('../index.js')
+  const store = createOriginalsStore({ originals: { path: origPath, enabled: true } }, () => {})
+  const long = `${'Exploring options. '.repeat(40)}I will patch a.txt now.`
+  const shaped = OpsTable.extract(long, { op: 'extract', maxChars: 240 })
+  store.put(shaped, long)
+  assert.ok(existsSync(origPath), '寄存表必须落盘')
+  assert.equal(store.get(shaped), long, '能按 shaped 文本取回原文（单射）')
+  assert.equal(store.get('不存在的文本'), undefined, '查不到就返回 undefined')
+})
+
+test('原文寄存：换轮即清空（防硬盘随会话线性增长）', async () => {
+  caseNo += 1
+  const origPath = join(TMP, `orig-turn-${caseNo}.jsonl`)
+  rmSync(origPath, { force: true })
+  const { createOriginalsStore } = await import('../index.js')
+  const store = createOriginalsStore({ originals: { path: origPath, enabled: true } }, () => {})
+  store.beginTurn(1)
+  store.put('shaped-A', 'original-A')
+  assert.equal(readFileSync(origPath, 'utf8').trim().split('\n').length, 1)
+  store.beginTurn(2)   // 换轮 ⇒ 清空
+  assert.equal(readFileSync(origPath, 'utf8'), '', '换轮后必须清空')
+  assert.equal(store.stats.purged, 1)
+  // 同一轮内不清空
+  store.put('shaped-B', 'original-B')
+  store.beginTurn(2)
+  assert.equal(readFileSync(origPath, 'utf8').trim().split('\n').length, 1, '同一轮不清空')
+})
+
+test('原文寄存：默认关闭时完全不写盘', async () => {
+  caseNo += 1
+  const origPath = join(TMP, `orig-off-${caseNo}.jsonl`)
+  rmSync(origPath, { force: true })
+  const { createOriginalsStore } = await import('../index.js')
+  const store = createOriginalsStore({ originals: { path: origPath, enabled: false } }, () => {})
+  store.beginTurn(1)
+  store.put('a', 'b')
+  assert.equal(existsSync(origPath), false, '关掉就不该产生文件')
+})
+
+test('原文寄存：运行时接上（走**真实的 llm/stream** 路径也要记）', async () => {
+  // ⚠️ 必须走 llm/stream。`setup()` 为了覆盖那段代码默认打开了 `surfaceAssistant: true`，
+  // 但那条路对 assistant/message 是**已知不可用**的（校验器冲突，默认关闭）；
+  // 用它测"运行时是否记寄存表"会得到"事件被拒 ⇒ 什么都没记"的假阴性。
+  // 推理的真实路径是 llm/stream 中间件。
+  caseNo += 1
+  const origPath = join(TMP, `orig-rt-${caseNo}.jsonl`)
+  rmSync(origPath, { force: true })
+  const logPath = join(TMP, `orig-rt-${caseNo}.log`)
+  rmSync(logPath, { force: true })
+  const listeners = []
+  const ctx = { on: (n, h) => { listeners.push({ n, h }); return () => {} } }
+  apply(ctx, {
+    logPath,
+    offSentinel: join(TMP, `orig-rt-${caseNo}.OFF`),
+    configPath: join(TMP, `orig-rt-${caseNo}.cfg.json`),
+    cache: { enabled: false },
+    originals: { enabled: true, path: origPath },
+    policy: { reasoning: { ops: [{ op: 'extract', maxChars: 240 }] } },
+  })
+  const h = listeners.find((l) => l.n === 'llm/stream').h
+  assert.ok(h, 'llm/stream 中间件必须已注册')
+  const long = `${'Exploring options and weighing tradeoffs. '.repeat(20)}I will patch a.txt now.`
+  const src = (async function* () { yield { type: 'reasoning', text: long }; yield { type: 'text', text: 'done' } })()
+  const out = []
+  for await (const c of h({ provider: 'x' }, () => src)) out.push(c)
+  assert.ok(String(out[0].text).length < long.length, '流里的推理应已被塑形')
+  assert.ok(existsSync(origPath), '运行时路径也要记寄存表')
+  const rec = JSON.parse(readFileSync(origPath, 'utf8').trim().split('\n')[0])
+  assert.equal(rec.v, long, '存的必须是**原文**（不是塑形结果）')
+  assert.equal(rec.k.length, 64, 'k 是 sha256 十六进制')
 })
 
 // ── 运行时路径的缓存判据（公开 API 测不到的那段）──
