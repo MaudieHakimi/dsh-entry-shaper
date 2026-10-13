@@ -132,7 +132,7 @@ return out
 | M3 | LLM 塑形 | ✅ 已实现为 `http`（OpenAI 兼容 + 显式 system + 脱敏 + 失败跳过），**带结果缓存** |
 | M4 | `shaper` 槽位化（库包/组合包 + `report-only`） | ⏳ 未做。当前是内置 op 表 + `policy`；`config.ops` / `inline.code` 已覆盖"接入自定义算法"的主要需求 |
 | M5 | tool-args 塑形 | ⏳ 未做（默认 `keep`），风险最高 |
-| M6 | **wire 级代理通道** | ✅ 已完成并实测（出网 −40%~−47%、命中 98.4%~99.6%、日志保留原文）⇒ **取代**了表面替换路线 |
+| M6 | **wire 级代理通道** | ✅ 已完成并实测（出网 −40%~−47%、命中 98.4%~99.6%）⇒ **取代**了表面替换路线。⚠️ 2026-10-13 修正：原文**不**保留在会话里，见 `docs/POLLUTION.md` + 侧路寄存表 `tools/original.mjs` |
 | M7 | 可热挂载 + 配置热读 + 免重启熔断 | ✅ patch 纯 insert、配置 mtime 热读、哨兵即停 |
 | M8 | **统一协议**（传输 × 数据格式） | ✅ v1.0.0：`exec` / `http` / `inline` + 统一信封与返回值；旧名 `python` / `summarize` 降为等价别名 |
 | M9 | 代理提供方"启动窗口"问题 | ✅ v1.0.1：启动期主动重试注册 + 未就绪时留痕（此前有 2~3 分钟窗口，模型选择器里看不到提供方） |
@@ -153,9 +153,11 @@ return out
   且**每步命中量按新增量平稳递增**（说明前缀在延长、没被重建）。这比"省了多少"更能说明问题；
 - **量**：本插件日志 `proxy-shape #n chars=A→B（累计 …）`（前 3 次 + 之后每 20 次）；
   要核对**真实出网内容**再用 `dsh-llm-tap`（`~/.dsh-llm-tap/llm-tap.jsonl`）；
-- **钱**：`dsh-context-slimmer/tools/session-cost-audit.mjs`，或本仓库 `tools/` 下的
-  `session-health.mjs` / `recount-miss.mjs` / `today-turns.mjs`（先看**断点数与断点税**，
+- **钱**：本仓库 `tools/` 下的 `session-health.mjs` / `recount-miss.mjs` / `today-turns.mjs`
+  / `cost-all-sessions.mjs` / `today-usage.mjs`（先看**断点数与断点税**，
   再看总账 —— 实测断点税常占未命中的 66%~87%）；
+  > ⚠️ 原先此处还指向 `dsh-context-slimmer/tools/session-cost-audit.mjs`，
+  > 但**该文件在本机不存在**（悬空引用）⇒ 已移除，功能由上面几个脚本覆盖。
 - **质**：固定任务集 A/B。agentic 基准**未观察到退化**（短任务 8/8、长轨迹 3/3），
   但任务规模仍小于真实长会话 ⇒ 强断言要等更长轨迹。
 

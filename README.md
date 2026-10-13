@@ -8,7 +8,7 @@
 > —— 它不改变模型"怎么想"，只改变模型"之后看到自己曾经想过什么"。
 > 详见[§ 这个插件真正在做什么](#这个插件真正在做什么留下填充词的增益去掉它的代价)。
 
-**状态**：实验性 · **默认关闭** · 测试 92/92 · Node ≥ 20 · MIT
+**状态**：实验性 · **默认关闭** · 测试 94/94 · Node ≥ 20 · MIT
 
 > ⚠️ **这句话的确切边界**（避免过度承诺）：
 > - "零断点税"指的是**本插件自身不引入**断点 —— 它不改已发送的内容、也不在 wire 上做
@@ -393,7 +393,7 @@ OpenAI 兼容端点，都通过同一套信封与返回规则接入 —— 这�
 | `keep` | — | 原样（默认） |
 | `drop` | — | 整块删除（**推理块例外**：内核退回短桩，见下） |
 | `stub` | — | 用 `stubTemplate`，默认 `[reasoning omitted: {chars} chars]` |
-| `extract` | `maxChars`(240)<br>`marker`(true) | 只留决策句；`marker:false` 去掉省略前缀 |
+| `extract` | `maxChars`(240)<br>`marker`(**false**) | 只留决策句。**默认不带任何前缀**；`marker:true` 才加 `[reasoning extract: N chars omitted] `（**会污染模型**，见 [`docs/POLLUTION.md`](docs/POLLUTION.md)） |
 | `head` / `tail` | `chars`(512) | 保留前 / 后 N 字符 |
 | `truncate` | `maxChars`(512) | 首尾各半 + `…（省略 N 字符）…` |
 
@@ -669,13 +669,14 @@ N=17 的配对样本不足以做强断言。
 | [`docs/PIPELINE.md`](docs/PIPELINE.md) | 工作管道：总图、时序（含 harness 源码出处）、元素生命周期、降级路径、验收观测点 |
 | [`docs/PROCESSING.md`](docs/PROCESSING.md) | 处理层规范：统一协议、op 目录、里程碑与被否掉的方案 |
 | [`docs/POLLUTION.md`](docs/POLLUTION.md) | **塑形标记如何污染模型**：wire 级取证、根治方案（默认去前缀）、原文寄存表与每轮清空策略、排查这类问题时的正确判据 |
+| [`docs/FILLER-WORDS.md`](docs/FILLER-WORDS.md) | **填充词（Hmm / Wait）为何可见、会不会自我强化**：机制、两次自我证伪、以及"未定论"的诚实边界 |
 | [`docs/VERIFICATION.md`](docs/VERIFICATION.md) | "省了多少"的独立核验：两路互不依赖的口径交叉验证、可信度分级、一次失败的重放尝试 |
 | [`docs/USAGE-LEDGER.md`](docs/USAGE-LEDGER.md) | 权威用量账本：费用结构、为何"命中率已到顶"、费用集中度与规模趋势 |
 | [`examples/custom-op.md`](examples/custom-op.md) | 接入自定义算法的五条路径 + 函数契约 + 热挂载取舍表 |
-| [`tools/README.md`](tools/README.md) | 会话体检与排障脚本（11 个，只读、零依赖）：命中率/断点/成本/搜索与子代理扇出定位 |
+| [`tools/README.md`](tools/README.md) | 会话体检与排障脚本（12 个，只读、零依赖）：命中率/断点/成本/搜索与子代理扇出定位、原文回溯 |
 | [`CHANGELOG.md`](CHANGELOG.md) | 变更记录（含被基准否掉的方案与踩过的坑） |
 | [`SECURITY.md`](SECURITY.md) | 边界与失败模式（含"本插件不做脱敏"这一明确边界） |
-| [`CONTRIBUTING.md`](CONTRIBUTING.md) | 改动前必读（6 条硬规则 + 发版前验证清单） |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | 改动前必读（12 条硬规则 + 发版前验证清单） |
 
 ## 开发
 

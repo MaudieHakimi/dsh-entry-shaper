@@ -38,6 +38,27 @@
 **证伪**：①关掉去重 ⇒ 去重用例变红；②关掉构造时清空 ⇒ 换轮用例变红。改回后 94/94。
 **部署验收**：`verify-106.mjs` 8/8（构造清空、去重、兜底三组）。
 
+### 文档一致性审计（一次全量核对）
+
+逐项核对了"文档里说的"与"仓库/代码里实际有的"，修掉 6 处不一致：
+
+| # | 问题 | 修法 |
+|---|---|---|
+| 1 | `README.md` 状态行仍写 **92/92**（实际 94） | 改为 **94/94** |
+| 2 | `docs/FILLER-WORDS.md` 存在但 **README 文档索引没列**（不可达） | 补进索引 |
+| 3 | README 索引写 tools **11 个**（实际 12） | 改为 **12 个**，并补"原文回溯" |
+| 4 | README 索引写 `CONTRIBUTING.md` **6 条硬规则**（实际 12） | 改为 **12 条** |
+| 5 | README 的 op 表写 `extract` 的 `marker` 默认 **true**（1.0.5 起已是 false） | 改为 **false** 并标注"会污染模型" |
+| 6 | **两处悬空引用**：`docs/PIPELINE.md` → `tools/probe-reasoning-passback.mjs`、`docs/PROCESSING.md` → `dsh-context-slimmer/tools/session-cost-audit.mjs`；**两个文件都不存在** | 前者改指实际的 `bench/passback-rule.mjs`；后者移除并列出本仓库覆盖该功能的脚本 |
+
+另修正两处**与实测不符**的旧宣称（同 1.0.5 的"保留原文"问题）：
+`docs/OFFICIAL-STACK.md` 的两处"保留原文"、`docs/PROCESSING.md` 的 M6 里程碑条目。
+`tools/README.md` 补注"除 `original.mjs` 外其余脚本都要求路径参数，不传会抛 `ERR_INVALID_ARG_TYPE`"。
+
+> 审计方法（可复用）：`git grep` 抽出文档里所有 `tools/*.mjs`、`bench/*.mjs`、`docs/*.md`
+> 引用并与文件系统逐个比对；再把文档里的**数量宣称**（测试数、脚本数、规则数）与实际计数比对。
+> **这两类不一致（悬空引用、过期计数）是文档最容易出、也最难靠人眼发现的问题。**
+
 ## [1.0.5] — 2026-10-13
 
 **根治"塑形标记污染模型"（本插件自己制造的副作用）+ 新增原文寄存表。**

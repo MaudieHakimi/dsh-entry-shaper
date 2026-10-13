@@ -77,7 +77,7 @@
 | 5 | session | 表面折叠 op、校验表面契约 | `packages/core/session/src/surface.ts:185-205`、`:331-345` |
 | 6 | token-meter | 校验 provenance（source 必须是同 step 的 chunk、不重复、严格更早） | `packages/llm/token-meter/src/index.ts:279-304` |
 | 7 | agent loop | `deriveMessages()` → `buildRequest()`（结果 `deepFreeze`）→ `llm.stream()` | `packages/core/agent-loop/src/agent.ts:341`、`:505` |
-| 8 | provider | 前缀缓存按**逐字前缀**命中（实测 `miss=250 hit=128`） | 探针 `tools/probe-reasoning-passback.mjs` |
+| 8 | provider | 前缀缓存按**逐字前缀**命中（实测 `miss=250 hit=128`） | 探针已并入 `bench/passback-rule.mjs` |
 | 9 | host apiproxy | 界面分页只数 append-origin 消息；替换副本不计额 | `packages/host/apiproxy/src/api-proxy.ts:218-227` |
 
 ## 3. 元素生命周期：为什么这样做是免费的

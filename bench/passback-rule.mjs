@@ -1,7 +1,7 @@
 // 查清 reasoning_content 回传的**确切规则**：到底哪些 assistant 消息必须带它？
 //
-// 背景：单轮探针（probe-reasoning-passback.mjs）显示"缺 reasoning_content 的工具轮"返回 200，
-// 但用**真实多轮历史**跑分歧基准时被拒：
+// 背景：早期的单轮探针（`probe-reasoning-passback.mjs`，**已并入本文件、不再单独存在**）
+// 显示"缺 reasoning_content 的工具轮"返回 200，但用**真实多轮历史**跑分歧基准时被拒：
 //   "The `reasoning_content` in the thinking mode must be passed back to the API."
 // 本探针用可控的多轮历史逐一变体，定位规则边界。
 //

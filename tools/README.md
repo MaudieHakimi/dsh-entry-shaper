@@ -24,6 +24,9 @@
 > （不是只读会话）—— 它是唯一能还原推理原文的地方，**每轮清空**、只覆盖当前轮。
 > ⚠️ `llm-tap.jsonl` 可达 **20+ GB**，用 `pair-wire-shaping.mjs` / `verify-wire-shaping.mjs`
 > 时务必只读尾部（它们已支持传入字节数参数，内部用 offset 读，不会整读）。
+>
+> ⚠️ **除 `original.mjs` 外，其余脚本都要求传入路径参数**；不传会直接抛
+> `ERR_INVALID_ARG_TYPE` 堆栈（不是友好的用法提示）。用法见上表第三列。
 
 `sessions 根目录` 通常是 `~/.dsh/sessions`（Windows：`$env:USERPROFILE\.dsh\sessions`）；
 `工作区目录` 是它下面的某一个 `--D-xxx--` 目录。

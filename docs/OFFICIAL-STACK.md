@@ -2,7 +2,7 @@
 
 > 结论先行：**DSH 自带栈里已经有一个"确定性免费剪枝器"和一个"摘要压缩器"**。
 > 本插件不是它们的替代品 —— 本插件的空位是**推理内容**（官方剪枝器完全不碰）
-> 与**保留原文的 wire 级塑形**（压缩做不到）。
+> 与**可回溯的出网侧塑形**（压缩做不到：它一旦发生就不可逆）。
 >
 > 如果只想"免费省 token 且不动历史"，请先调 `tool-result-pruner` 的阈值，别开本插件。
 
@@ -55,8 +55,12 @@
    compaction 只会"整段丢"。`policy.reasoning` 的 op 链（默认 `extract`）正打在这个空位上。
 2. **按类别的策略。** pruner 只有一个全局字符阈值，不区分 reasoning / toolResult / toolArgs /
    assistantText，也不认识"这条 tool result 是 200KB 日志里的一行命中"。
-3. **保留原文的出网塑形。** compaction 一旦发生就不可逆；本插件的 `proxy` 通道只改发出去的
-   messages，日志与界面保留原文 ⇒ 既有缩减又不丢历史。
+3. **出网侧的塑形 + 原文可回溯。** compaction 一旦发生就不可逆；本插件的 `proxy` 通道
+   只改**发出去的那一份** messages，**推理原文另存侧路寄存表**（`tools/original.mjs`，每轮清空）
+   ⇒ 既有缩减又不丢历史。
+   > ⚠️ **2026-10-13 修正**：此处原写"日志与界面保留原文"，与实测不符 —— 实测模型返回的推理
+   > chunk 已是塑形形态，而 `agent-loop/src/agent.ts:348` 会把中间件之后的每个 chunk
+   > `session.append` 进会话 ⇒ **会话里存的也是塑形后文本**。取证见 `docs/POLLUTION.md`。
 
 ## 5. 怎么选
 
