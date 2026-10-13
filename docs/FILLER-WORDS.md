@@ -81,10 +81,86 @@ return last.slice(-maxChars)            // ← 抽不到就退回"最后一句"
 - ❌ **不做过度声明**：本插件没有做过该 A/B，所以"消除填充词强化"是**基于机制的推论**，
   不是实测结论。README 里已按同一原则标注边界。
 
-## 5. 复现
+## 5. ★ 实测发现：`Let me` 才是最大的那一类（2026-10-13）
+
+维护者在长会话里**亲身观察到**："注意力真的全被保留的 `Let me` 吃了"。
+这句话引出一次测量，结果比预期严重得多。
+
+### 5.1 实时流是**原文**（先确认前提）
+
+| 环节 | 内容 |
+|---|---|
+| 界面实时渲染 | **原文** ✓（代理开启 ⇒ 流过滤让路 ⇒ chunk 原样流过） |
+| 写入会话 | **原文** ✓ |
+| **出网那一刻** | **塑形**（extract 后的决策句） |
+
+⇒ 所以"能看见 `Hmm`"是必然的（原文里有）；塑形只发生在**进出网的那一份**。
+
+> 判据修正（踩过）：`session.jsonl.zstd` 只存了 **1.498%** 的事件
+> （seq 跨度 3,435,309 仅存 51,451 条）⇒ `assistant/chunk` 是**抽样**，
+> **不能**用它判断流形态。正确数据源是 `reasoning-chunks`（全量聚合，按 **`time0`** 排序）。
+
+### 5.2 测量：`extract` 保留下来的是什么？
+
+对真实推理块跑 `extractReasoning`，统计**保留下来的句子**：
+
+```
+保留句子总数 8764
+其中"自我叙述式"（Let me / I will / Now I / I should…）= 6738 = 76.9%   ✗
+```
+
+样本（全是保留下来的）：
+
+```
+"Let me start by reading the two referenced files and globbing for .md files…"
+"Let me glob more specifically at the top level and in the project directories."
+"Now I have a good understanding."
+"Let me summarize the project understanding for the user."
+"I need to anchor patterns."
+```
+
+### 5.3 结论：这是一个**设计缺陷**，不是调参问题
+
+`DECISION_RE` 把 `let me` / `i will` / `now i` 当作"**决策句**标记"。
+但它们与 `Hmm` 是**同一类东西** —— 自我叙述填充 —— 只是更长：
+
+| | `Hmm` | `Let me` |
+|---|---|---|
+| 性质 | 自我叙述填充 | **自我叙述填充**（同样） |
+| 长度 | 1 词 | 一整句 |
+| 信息量 | ≈0 | **≈0**（是"意图"，不是"结论"） |
+| 本插件 | 浮空句被压掉 ✓ | **系统性保留并回灌** ✗ |
+
+⇒ **插件压掉了短的自我叙述，却系统性地留下了长的**。而长的那类占的 token 多得多
+⇒ 回灌进上下文的自我叙述噪音**不降反升**。
+
+**根因**：判据是"**是不是决策句**"，而不是"**有没有信息增量**"。
+`"Let me check the config"` 是决策句，但真正的信息是结论（`"配置在 X 处，值是 Y"`）。
+
+### 5.4 这对"算法该怎么定"的启示
+
+对 DeepSeek 这类模型的**行为模式**，这次实验给出一条可操作的判据：
+
+> **按"信息增量"筛，而不是按"句式角色"筛。**
+> 意图句（将来式：`Let me…` / `I will…` / `Now I…`）信息量最低却最容易匹配句式模板；
+> 结论句（完成态/事实陈述：`X is at Y` / `the bug is Z`）才是后续推理真正需要的。
+
+候选实现方向（**未实施**，需先量化收益再决定默认值）：
+
+1. **剥离自我叙述前缀**：`"Let me check the config"` → `"check the config"` —— 保留动作、去掉主语框架；
+2. **偏好结论句**：优先选完成态/事实句，而不是将来的意图句；
+3. **新增可组合 pure op**（如 `stripNarration`）：只去掉 `Let me / I will / Now I` 开头，
+   可与 `extract` 链式组合（`extract → stripNarration`）。
+
+⚠️ **注意**：3 条都只影响**出网那一份**，界面实时流仍是原文 ⇒ 不影响可读性与审计。
+
+## 6. 复现
 
 ```powershell
 cd 'D:\DSH Desktop\.research'
+node check-stream-raw.mjs    # 实时流形态 + 自我叙述占比（本文 5.1/5.2 的数）
+node check-live-form.mjs     # 按时间看推理块是否带记账格式
+node check-seq-density.mjs   # 事件抽样率（1.498%）
 node check-mechanism.mjs     # 决策句/短块护栏的行为
 node check-filler-real.mjs   # 塑形后文本里填充词的形态（1060 万字符）
 node check-filler4.mjs       # 跨轮趋势（含"排除调试会话"的判据）
