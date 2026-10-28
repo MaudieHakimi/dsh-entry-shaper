@@ -299,13 +299,21 @@ DSH 的 `compaction-basic` 在**出口**改历史：把已发送的区间换成�
 ## 安装
 
 ```powershell
-# 路径换成你放本包的位置
+# 从 npm（发布后可用；包名已确认可用，见 docs/NPM.md 的当前状态）
+dsh plugin --profile web add dsh-entry-shaper
+
+# 或从本地路径
 dsh plugin --profile web add "file:D:\plugins\dsh-entry-shaper"
 ```
 
 或手动：把目录复制进 `<profile>\node_modules\`，并把 `dsh-entry-shaper` 加进 profile
 `package.json` 的 `dependencies` **与 `dsh.profile.bundles`**（后者决定它是否被加载；
 `dsh.bundle.patch` 必须仍指向本包的 `cordis.patch.yml`，否则启动即抛错）。
+
+> **npm 发布状态**：`package.json` 已具备发布条件（`private` 已移除、
+> `publishConfig.access = public`、打包内容 31 文件 / 308 KB 已实测），
+> 但**尚未执行 `npm publish`**（需要作者登录 npm 账号）。
+> 发布流程与沙箱下的坑见 [`docs/NPM.md`](docs/NPM.md)。
 
 ## 配置
 
@@ -756,6 +764,7 @@ N=17 的配对样本不足以做强断言。
 | [`docs/FILLER-WORDS.md`](docs/FILLER-WORDS.md) | **填充词（Hmm / Wait）为何可见、会不会自我强化**：机制、两次自我证伪、以及"未定论"的诚实边界 |
 | [`docs/VERIFICATION.md`](docs/VERIFICATION.md) | "省了多少"的独立核验：两路互不依赖的口径交叉验证、可信度分级、一次失败的重放尝试 |
 | [`docs/USAGE-LEDGER.md`](docs/USAGE-LEDGER.md) | 权威用量账本：费用结构、为何"命中率已到顶"、费用集中度与规模趋势 |
+| [`docs/NPM.md`](docs/NPM.md) | **发布到 npm**：首次发布流程、后续版本纪律、消费者装法、沙箱下 npm 缓存的坑、与市场渠道的关系 |
 | [`examples/custom-op.md`](examples/custom-op.md) | 接入自定义算法的五条路径 + 函数契约 + 热挂载取舍表 |
 | [`examples/diverse-filler.md`](examples/diverse-filler.md) | **确定性"多样填充词"替换**：可运行原型、`inline.code` 无 `require` 的实测坑、以及区分两种病因的三臂对照实验设计 |
 | [`tools/README.md`](tools/README.md) | 会话体检与排障脚本（12 个，只读、零依赖）：命中率/断点/成本/搜索与子代理扇出定位、原文回溯 |

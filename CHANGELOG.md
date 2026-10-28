@@ -8,7 +8,41 @@
 
 ## [1.0.6] — 2026-10-13
 
-**寄存表的增长控制（1.0.5 上线后由真实运行数据暴露）+ 文档去本地化。**
+**寄存表的增长控制（1.0.5 上线后由真实运行数据暴露）+ 文档去本地化 + npm 发布就绪。**
+
+### npm 发布就绪（尚未 publish）
+
+此前 `package.json` 是 `"private": true` ⇒ **根本发不了 npm**。已改造为可发布：
+
+- **移除 `private: true`**（这是唯一的硬阻塞）
+- 补 `repository` / `homepage` / `bugs` / `author` / `engines`（Node ≥ 20）
+- 补 `publishConfig: { access: "public" }`
+- 加 `prepublishOnly` 脚本（`node --check index.js && npm test`）—— 防止发坏包
+- keywords 扩到 10 个（补 `deepseek-harness` / `context` / `prompt-cache` / `token-saving` / `cost-optimization`）
+
+**实测验证（全部通过）**：
+
+| 项 | 结果 |
+|---|---|
+| 包名 `dsh-entry-shaper` 可用性 | ✓ registry 查询 404（未被占用） |
+| `@deepseek-ai/cordis` peer 可解析 | ✓ npm 上 latest 4.0.5，`^4.0.0` 匹配 |
+| `npm pack --dry-run` | ✓ **31 文件 / 307.7 KB**，无测试/临时文件混入 |
+| **真实 tarball 安装**（模拟消费者） | ✓ `npm i <tgz>` 成功；11 个导出全部存在；`extract` 行为正确（输出干净、无记账格式） |
+| `cordis.patch.yml` 随包正确 | ✓ 与源**逐字节相同**、有效 UTF-8、**纯 insert**（行首 `config:` = 0）⇒ 市场可热挂载 |
+
+**新增 [`docs/NPM.md`](docs/NPM.md)**：首次发布流程、后续版本纪律（`npm version` 必须与
+CHANGELOG 条目一致）、消费者两种装法、**与市场渠道的关系**（两处 description 独立、
+措辞有意不同，不要强行统一），以及**沙箱下 npm 缓存的坑**：
+
+> npm 默认用 `%LOCALAPPDATA%\npm-cache`，而 DSH 文件沙箱只允许写工作区 ⇒
+> `npm pack` 会报 `EPERM ... \npm-cache\_cacache\tmp`。
+> 解法：`npm <cmd> --cache "<工作区内路径>"`。
+
+**顺带修掉一个编码缺陷**：`.gitignore` 末行注释含 `U+FFFD` 替换字符（历史编码损坏），
+已重写为有效 UTF-8（LF、无 BOM），并补 `*.tgz` / `npm-debug.log*` / `.npm-cache/`。
+
+> 全仓库扫描确认：除 `bench/agentic/.work/` 下两个 **gitignored 生成物**外，
+> 无其它编码损坏文件。
 
 ### 文档：把"作者本机专属"的引用改成通用描述
 

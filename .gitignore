@@ -4,9 +4,14 @@ test/.tmp/
 *.OFF
 .DS_Store
 
+# npm 打包产物（npm pack 生成，不入库）
+*.tgz
+npm-debug.log*
+.npm-cache/
+
 # 基准产物（临时输出，不入库）
 bench-out*.txt
 bench/agentic/.work/
 
-# examples/compose-demo.mjs ����ʱ����
+# examples/compose-demo.mjs 的临时产物
 examples/.compose-demo.*
