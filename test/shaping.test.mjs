@@ -8,7 +8,7 @@ import { mkdirSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { apply, applyOps, createOpCache, createProxyAdapter, extractReasoning, mergeCfg, shapeMessages } from '../index.js'
+import { apply, applyOps, createOpCache, createProxyAdapter, extractReasoning, mergeCfg, shapeMessages, OPS } from '../index.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const TMP = join(HERE, '.tmp')
@@ -708,6 +708,224 @@ test('op 组合：全 keep 时不产生任何事件（不做无谓替换）', as
   })
   await settle()
   assert.equal(appends.length, 0)
+})
+
+// ── skim：工具输出"留锚点、折中间"（专为 toolResult 设计）──
+
+test('skim：短输入原样返回（小输出本身信息密度高，折叠是净亏）', () => {
+  const t = 'line one\nline two\n'
+  assert.equal(OPS.skim(t, { minChars: 2048 }), t)
+})
+
+test('skim：长输出被折叠，且首尾行保留', () => {
+  const lines = []
+  for (let i = 0; i < 200; i++) lines.push(`plain filler line ${i} ${'z'.repeat(20)}`)
+  const t = lines.join('\n')
+  const out = OPS.skim(t, { minChars: 512, headLines: 5, tailLines: 3, numStep: 4 })
+  assert.ok(out.length < t.length, '必须真的变短')
+  assert.ok(out.includes('plain filler line 0'), '首行保留')
+  assert.ok(out.includes('plain filler line 199'), '尾行保留')
+  assert.ok(out.includes('省略'), '必须有省略计数')
+})
+
+test('skim：路径行与错误行**永不丢失**（用户的硬要求）', () => {
+  const lines = []
+  for (let i = 0; i < 120; i++) lines.push(`noise ${i} ${'q'.repeat(30)}`)
+  // 埋在中间的锚点：Windows 路径 / 退出码 / TS 诊断码 / 错误
+  lines.splice(40, 0, 'D:\\DSH Desktop\\dsh-entry-shaper\\index.js')
+  lines.splice(70, 0, '[exit code: 1]')
+  lines.splice(100, 0, 'src/renderer/app.ts(42,7): error TS2322')
+  lines.splice(110, 0, 'Error: ENOENT: no such file or directory')
+  const t = lines.join('\n')
+  const out = OPS.skim(t, { minChars: 512, headLines: 3, tailLines: 2, numStep: 8 })
+  assert.ok(out.length < t.length)
+  assert.ok(out.includes('dsh-entry-shaper\\index.js'), '路径行不能丢')
+  assert.ok(out.includes('[exit code: 1]'), '退出码不能丢')
+  assert.ok(out.includes('error TS2322'), 'TS 诊断码不能丢')
+  assert.ok(out.includes('ENOENT'), '错误行不能丢')
+})
+
+test('skim：行号密集区被抽稀（read 的输出形态）', () => {
+  const lines = []
+  for (let i = 1; i <= 200; i++) lines.push(`${i}: code line ${i} ${'c'.repeat(15)}`)
+  const t = lines.join('\n')
+  const out = OPS.skim(t, { minChars: 512, headLines: 2, tailLines: 2, numStep: 10 })
+  assert.ok(out.length < t.length)
+  // 抽稀后仍能看到行号，而不是全丢
+  assert.ok(/\n\d+: /.test(out), '抽稀后仍保留行号形态')
+  // 但不应逐行全留
+  const keptNumLines = out.split('\n').filter((l) => /^\s*\d+: /.test(l)).length
+  assert.ok(keptNumLines < 200, `行号行应被抽稀，实际保留 ${keptNumLines}`)
+  assert.ok(keptNumLines > 5, `不应抽到没有，实际保留 ${keptNumLines}`)
+})
+
+test('skim 回归：行数少但含锚点时，不因"行数不足"而退化丢锚点', () => {
+  // 曾有的 bug：`lines.length < headLines + tailLines + 4` 直接走字符切半，
+  // 把中间的真实路径行切掉 ⇒ 实测 137 条路径丢失。
+  //
+  // 用例必须同时满足三条，否则变异回旧逻辑时仍然通过（踩过两次）：
+  //   ① 行数 < 16（命中旧的退化条件）
+  //   ② 锚点不在 headLines(前 8) 也不在 tailLines(后 4) 里
+  //   ③ 锚点落在**字符** 50% 之后（否则字符切半也留得下）
+  const lines = [
+    'a'.repeat(400),            // 0  前半段（把 50% 分界推后）
+    'filler1',                  // 1
+    'filler2',                  // 2
+    'filler3',                  // 3
+    'filler4',                  // 4
+    'filler5',                  // 5
+    'filler6',                  // 6
+    'filler7',                  // 7   ← headLines=8 到这一行为止
+    'mid filler',               // 8
+    'D:\\DSH Desktop\\target\\README.zh.md',   // 9  ← 锚点：既不在头也不在尾
+    'tail filler a',            // 10 ← tailLines=4 从这里开始
+    'tail filler b',            // 11
+    'tail filler c',            // 12
+    'tail filler d',            // 13
+  ]
+  const t = lines.join('\n')
+  const lineCount = t.split('\n').length
+  assert.equal(lineCount, 14, `本用例必须 14 行（<16 且 >12），实际 ${lineCount}`)
+  const anchorAt = t.indexOf('README.zh.md')
+  assert.ok(anchorAt > t.length / 2, `锚点须在字符 50% 之后才覆盖旧 bug，实际 ${anchorAt}/${t.length}`)
+
+  const out = OPS.skim(t, { minChars: 256, headLines: 8, tailLines: 4, numStep: 4 })
+  assert.ok(out.includes('target\\README.zh.md'), '短行路径锚点绝不能被"行数不足"的兜底切掉')
+})
+
+test('skim 回归：个别超长行就地截短，不拖累整条结果的锚点保留', () => {
+  // 曾有的 bug：任一行超长 ⇒ 整条走字符切半 ⇒ 中间的真实路径行被切掉。
+  // 实测：16 行 / 2982 字符的 grep 结果里，81 字符的路径行因两行 793/760 字符而丢失。
+  const lines = [
+    'Found 5 matches',
+    '',
+    'D:\\DSH Desktop\\long\\first.md',
+    `Line 22: ${'{"type":"session_event","data":'}` + 'A'.repeat(700) + '}',
+    '',
+    'D:\\DSH Desktop\\packages\\compaction\\README.zh.md',
+    `Line 23: ${'{"type":"user/message"}'}` + 'B'.repeat(700),
+    '',
+    'D:\\DSH Desktop\\packages\\compaction\\src\\summarizer.ts',
+    'tail line here',
+  ]
+  const t = lines.join('\n')
+  const out = OPS.skim(t, { minChars: 512, headLines: 8, tailLines: 4, numStep: 4 })
+  assert.ok(out.includes('compaction\\README.zh.md'), '超长行不能拖累其它行的锚点保留')
+  assert.ok(out.includes('compaction\\src\\summarizer.ts'), '超长行不能拖累其它行的锚点保留')
+  assert.ok(out.includes('本行省略'), '超长行自身应被就地截短并计数')
+})
+
+test('skim：绝不比原文长（撑大是净亏 ⇒ 退回原文）', () => {
+  const lines = []
+  for (let i = 0; i < 30; i++) lines.push(`s${i}`)
+  const t = lines.join('\n')
+  const out = OPS.skim(t, { minChars: 0, headLines: 28, tailLines: 20, numStep: 1 })
+  assert.ok(out.length <= t.length, `不得撑大：${out.length} > ${t.length}`)
+})
+
+test('skim：anchors:false 时不做锚点保留（可显式关闭）', () => {
+  const lines = []
+  for (let i = 0; i < 120; i++) lines.push(`noise ${i} ${'q'.repeat(30)}`)
+  lines.splice(60, 0, 'D:\\DSH Desktop\\only-anchor\\file.js')
+  const t = lines.join('\n')
+  const withAnchors = OPS.skim(t, { minChars: 512, headLines: 2, tailLines: 2, numStep: 8, anchors: true })
+  const without = OPS.skim(t, { minChars: 512, headLines: 2, tailLines: 2, numStep: 8, anchors: false })
+  assert.ok(withAnchors.includes('only-anchor\\file.js'), '默认保留锚点')
+  assert.ok(!without.includes('only-anchor\\file.js'), 'anchors:false 时不保留')
+  assert.ok(without.length <= withAnchors.length, '关掉锚点后应更短')
+})
+
+test('skim：走事件通道时 toolResult 被塑形（op 已接进 OPS 表）', async () => {
+  const { handlers, appends, session } = setup({
+    policy: { toolResult: { ops: [{ op: 'skim', minChars: 200, headLines: 3, tailLines: 2, numStep: 8 }] } },
+  })
+  const lines = []
+  for (let i = 0; i < 100; i++) lines.push(`noise ${i} ${'q'.repeat(20)}`)
+  lines.splice(50, 0, 'D:\\DSH Desktop\\kept\\file.js')
+  emit(handlers, session, {
+    type: 'tool/result', seq: 901, surfaceOp: 'append',
+    data: { message: { content: [{ type: 'tool-result', toolCallId: 'c1', content: [{ type: 'text', text: lines.join('\n') }] }] } },
+  })
+  await settle()
+  assert.equal(appends.length, 1, '应产生一次替换')
+  const text = appends[0][1].message.content[0].content[0].text
+  assert.ok(text.length < lines.join('\n').length, '确实变短')
+  assert.ok(text.includes('kept\\file.js'), '锚点仍在')
+})
+
+test('skim：shapeMessages 通道下同样生效（不依赖事件通道）', async () => {
+  const lines = []
+  for (let i = 0; i < 100; i++) lines.push(`noise ${i} ${'q'.repeat(20)}`)
+  lines.splice(50, 0, 'D:\\DSH Desktop\\kept\\file.js')
+  const raw = lines.join('\n')
+  const messages = [{
+    role: 'user',
+    content: [{ type: 'tool-result', toolCallId: 'c1', content: [{ type: 'text', text: raw }] }],
+  }]
+  const out = await shapeMessages(messages, { toolResult: { ops: [{ op: 'skim', minChars: 200, headLines: 3, tailLines: 2, numStep: 8 }] } }, {})
+  const text = out[0].content[0].content[0].text
+  assert.ok(text.length < raw.length)
+  assert.ok(text.includes('kept\\file.js'))
+})
+
+test('skim 必须在 PURE_OPS 里（纯函数不该走结果缓存，白占磁盘）', async () => {
+  // 判据来自 index.js 的缓存策略：只有"无法证明是纯函数"的 op 才进缓存。
+  // skim 是确定性的行处理 ⇒ 必须被认成纯 op，否则日志里会刷满缓存命中。
+  const raw = `${'padding line content here\n'.repeat(200)}`
+  let cacheWrites = 0
+  const cache = {
+    enabled: true,
+    keyOf: () => 'k',
+    get: () => undefined,
+    put: () => { cacheWrites += 1 },
+  }
+  await applyOps(raw, [{ op: 'skim', minChars: 200 }], { cache, stubTemplate: '[x]' })
+  assert.equal(cacheWrites, 0, 'skim 是纯 op，不应写缓存')
+})
+
+test('代理统计必须把 tool-result 正文算进去（否则工具输出压缩在日志里不可见）', async () => {
+  // 曾经的问题：measure() 只累加 b.text / b.arguments，而 tool-result 的正文
+  // 嵌在 b.content 里 ⇒ 塑形工具输出时 before===after ⇒ onShaped 不被调用、
+  // proxy-shape 日志不刷 ⇒ **省了 37% 却看不出来**（本机实测踩到）。
+  const lines = Array.from({ length: 200 }, (_, i) => `${i + 1}: payload ${'p'.repeat(60)}`)
+  lines.splice(100, 0, 'D:\\DSH Desktop\\anchor\\file.ts')
+  const raw = lines.join('\n')
+
+  const stats = []
+  const llm = {
+    async resolveModelInfo() { return { id: 'up', contextWindow: 1000 } },
+    async listModels() { return [] },
+    stream(options) {
+      return (async function* () {
+        const tb = options.messages[0].content.find((b) => b.type === 'tool-result')
+        yield { type: 'text', text: String(tb?.content?.[0]?.text?.length ?? -1) }
+      })()
+    },
+  }
+  const adapter = createProxyAdapter({
+    llm,
+    upstream: 'up',
+    policy: { toolResult: { ops: [{ op: 'skim', minChars: 512, numStep: 2 }] } },
+    ctx: {},
+    onShaped: (s) => stats.push(s),
+  })
+  let shapedLen = -1
+  for await (const chunk of adapter.stream({
+    provider: 'shaped',
+    model: 'm',
+    messages: [{
+      role: 'user',
+      content: [{ type: 'tool-result', toolCallId: 'c1', content: [{ type: 'text', text: raw }] }],
+    }],
+  })) {
+    if (chunk?.type === 'text') shapedLen = Number(chunk.text)
+  }
+
+  assert.ok(shapedLen > 0 && shapedLen < raw.length, `tool-result 应被压缩：${shapedLen} / ${raw.length}`)
+  assert.ok(stats.length > 0, 'onShaped 应被调用（before !== after）')
+  const s = stats[0]
+  assert.ok(s.before >= raw.length, `before 必须把 tool-result 正文算进去（实际 ${s.before}，正文 ${raw.length}）`)
+  assert.ok(s.after < s.before, `after 应小于 before：${s.before} → ${s.after}`)
 })
 
 // ── 推理的真实通道：llm/stream 中间件（表面替换那条路已知不可用）──

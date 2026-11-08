@@ -139,7 +139,7 @@ R1 论文里的 "aha moment" 说的就是此类行为的涌现，见
 
 **这个插件真正的价值不在它自带的那几个 op，而在于它是一条"可插拔的管道"。**
 
-内置 op（`keep` / `extract` / `truncate` / …）都是**启发式的、语言无关的**小工具 ——
+内置 op（`keep` / `extract` / `truncate` / `skim` / …）都是**启发式的、语言无关的**小工具 ——
 它们能省 token，但**不懂你的任务**。真正能把上下文质量提上去的，是**你自己针对
 所用模型的行为模式**写的算法。插件负责的是那些**枯燥但关键**的部分：
 
@@ -487,8 +487,35 @@ OpenAI 兼容端点，都通过同一套信封与返回规则接入 —— 这�
 | `extract` | `maxChars`(240)<br>`marker`(**false**) | 只留决策句。**默认不带任何前缀**；`marker:true` 才加 `[reasoning extract: N chars omitted] `（**会污染模型**，见 [`docs/POLLUTION.md`](docs/POLLUTION.md)） |
 | `head` / `tail` | `chars`(512) | 保留前 / 后 N 字符 |
 | `truncate` | `maxChars`(512) | 首尾各半 + `…（省略 N 字符）…` |
+| `skim` | `minChars`(2048)<br>`headLines`(8)<br>`tailLines`(4)<br>`numStep`(4)<br>`maxLineChars`(400)<br>`anchors`(true) | **专为工具输出设计的"留锚点、折中间"**。见下 |
 
 **每个 op 都可以带** `timeoutMs`（覆盖超时）与 `cache: false`（**非纯 op 别关**）。
+
+#### `skim` 与 `truncate` 的区别（工具输出该用哪个）
+
+`truncate` 按**字符**首尾各半，会直接把中间的路径行/错误行切掉。`skim` 按**行**处理：
+
+1. **首 `headLines` 行 + 尾 `tailLines` 行** —— 拿住开头语境与最终结论
+2. **锚点行全留** —— 非零退出码、错误、`ENOENT`/`EACCES`、`TS1234` 诊断码、
+   路径（Windows `D:\` 与 POSIX）、`PASS`/`FAIL`、`not found`/`失败`/`无法`
+3. **行号密集区抽稀** —— `read` 的输出形如 `123: xxx`，连续行号占全量行的 **29.8%**；
+   每 `numStep` 行留 1 行，保住"有哪些行、结构怎样"而不逐行搬运
+4. 超长单行（> `maxLineChars`）**就地截短**，不拖累其它行的锚点保留
+
+**实测（本机 13,500 个真实 tool-result，1,488 万字符）**：
+
+| 指标 | 结果 |
+|---|---|
+| 体积压缩 | **−50.3%**（参数 `minChars=1024, numStep=4`） |
+| 短行路径锚点丢失 | **0 / 33,934** |
+| 短行错误锚点丢失 | **0 / 1,460** |
+| 撑大 | 0（比原文长就退回原文） |
+
+> 长行（>300 字符）里那 136 条"丢失"是 `.js`/`.mjs` 之类在 HTML/JSON 长行中的**偶然匹配**，
+> 不是路径锚点 —— 度量时已单独分类。
+
+**注意**：官方 `tool-result-pruner` 已在做粗粒度首尾修剪（`thresholdChars=8192`），
+两者**不冲突**：pruner 改的是 session 表面（落地），`skim` 只改出网副本（不落地、不破前缀缓存）。
 
 ### 复制即用的配置片段
 
@@ -501,7 +528,9 @@ OpenAI 兼容端点，都通过同一套信封与返回规则接入 —— 这�
 "reasoning": { "ops": [{ "op": "extract", "maxChars": 400 }, { "op": "truncate", "maxChars": 300 }] }
 // ④ 完全不动推理
 "reasoning": { "ops": [{ "op": "keep" }] }
-// ⑤ 工具结果只留首尾（注意官方 tool-result-pruner 已在做，别重复）
+// ⑤ 工具结果留锚点折中间（推荐；比 truncate 安全得多）
+"toolResult": { "ops": [{ "op": "skim", "minChars": 1024, "numStep": 4 }] }
+// ⑤′ 工具结果只留首尾字符（会切掉中间的路径/错误行，不推荐）
 "toolResult": { "ops": [{ "op": "truncate", "maxChars": 1024 }] }
 // ⑥ 你自己的脚本（任何语言）
 "reasoning": { "ops": [{ "op": "exec", "command": "python", "script": "D:/shaper/mine.py" }] }

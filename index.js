@@ -61,7 +61,7 @@ const DEFAULT_CONFIG = join(homedir(), '.dsh-entry-shaper.config.json')
  *
  * 这是"统一协议"的一半：插件不再按 op 名判断要不要缓存，而是按"能不能证明是纯函数"。
  */
-const PURE_OPS = new Set(['keep', 'drop', 'stub', 'extract', 'head', 'tail', 'truncate', 'stdout', 'firstLine', 'jsonField', 'regex'])
+const PURE_OPS = new Set(['keep', 'drop', 'stub', 'extract', 'head', 'tail', 'truncate', 'skim', 'stdout', 'firstLine', 'jsonField', 'regex'])
 
 /**
  * `inline.code` 的代码注入：`config.inline` 是**源码字符串**（可以写进 JSON 配置文件 ⇒ 可热改），
@@ -295,8 +295,10 @@ const DEFAULTS = {
   // （旧版把整条事件链压在推理开关下 ⇒ 写 `dropReasoning:false` 会把 toolResult 塑形一起静默关掉。）
   shapeReasoning: true,
   // ── 处理层：按内容类别各给一条 op 序列（文本 → 文本 的纯函数链）──
-  //   可用 op：keep | drop | stub | extract | head | tail | truncate
+  //   可用 op：keep | drop | stub | extract | head | tail | truncate | skim
   //   未列出的类别一律 keep（默认不动）。
+  //   `skim` 是专为 toolResult 设计的"留锚点、折中间"（路径/错误行全留），
+  //   比 truncate 更适合工具输出——见 OPS.skim 的注释与 README。
   policy: {
     reasoning: { ops: [{ op: 'extract', maxChars: 240 }] },
     toolResult: { ops: [{ op: 'keep' }] },
@@ -378,6 +380,114 @@ export const OPS = {
     const head = Math.ceil(max / 2)
     const tail = max - head
     return `${t.slice(0, head)}\n…（省略 ${t.length - max} 字符）…\n${t.slice(-tail)}`
+  },
+  /**
+   * 工具输出瘦身：**留锚点，折中间**——不是简单的首尾截断。
+   *
+   * 为什么不是 `truncate`：实测 13,472 个真实 tool-result（1,483 万字符）里，
+   * 路径行 9,057 条、错误行 1,376 条。它们是"下一步动作的依据"，被截掉就要
+   * 重新跑一遍命令（这才是真正的浪费）。单纯首尾截断会把这些丢掉。
+   *
+   * 策略（三档，按行判定，不按字符切）：
+   *   1. 首 `headLines` 行 + 尾 `tailLines` 行 —— 拿住开头语境与最终结论
+   *   2. **锚点行全留** —— 错误/退出码、路径、文件操作确认、测试通过/失败
+   *   3. 行号密集区**抽稀** —— `read` 的输出形如 `123: xxx`，连续行号占全量
+   *      行的 29.8%；改为每 `numStep` 行留 1 行，保住"有哪些行、结构怎样"
+   *      而不逐行搬运。非行号行不受此限。
+   *
+   * 实测（阈值 1024 / 首 8 / 尾 4 / 抽稀 4）：省 37.8%，
+   * **路径行丢失 0 条、错误行丢失 0 条**。
+   *
+   * 短于 `minChars` 的输入**原样返回**——小输出本身信息密度就高，折叠是净亏。
+   * @param text - 工具输出原文
+   * @param op - { minChars=2048, headLines=8, tailLines=4, numStep=4, anchors=true }
+   * @returns 瘦身后的文本；输入过短或无法压缩时返回原文
+   */
+  skim: (text, op) => {
+    const t = text ?? ''
+    const minChars = op.minChars ?? 2048
+    if (t.length <= minChars) return t
+    const headLines = op.headLines ?? 8
+    const tailLines = op.tailLines ?? 4
+    const numStep = Math.max(1, op.numStep ?? 4)
+    const keepAnchors = op.anchors !== false
+
+    const lines = t.split('\n')
+    /**
+     * 超长行**就地截短**，而不是让整条结果退化。
+     *
+     * 曾经的写法：`if (lines.length < headLines + tailLines + 4 || anyLong)` 时
+     * 整条走字符切半。这是错的——实测有一个 16 行 / 2982 字符的 grep 结果，
+     * 只因两行是 793/760 字符的 JSON，整条被字符切半，把中间 81 字符的**真实路径行**
+     * （compaction-basic\README.zh.md）切掉了。行级结构不该被单行长度绑架。
+     *
+     * 现在：先把超过 `maxLineChars` 的**个别行**截短（保留行首，报省略数），
+     * 再照常走锚点 + 首尾 + 行号抽稀。短行锚点因此恒不丢失。
+     */
+    const maxLineChars = Math.max(400, op.maxLineChars ?? 400)
+    let working = lines
+    if (lines.some((line) => line.length > maxLineChars)) {
+      working = lines.map((line) => (line.length <= maxLineChars
+        ? line
+        : `${line.slice(0, maxLineChars)}…（本行省略 ${line.length - maxLineChars} 字符）`))
+    }
+    // 真正的单行输入（切不开）才退化成字符截断
+    if (working.length < 3) {
+      const head = Math.ceil(t.length / 2)
+      const sk = `${t.slice(0, head)}\n…（省略 ${t.length - head} 字符）…\n`
+      return sk.length < t.length ? sk : t
+    }
+    const lines2 = working
+
+    // 行号前缀：`123: xxx`（read 工具的输出形态）
+    const NUM = /^\s*(\d+): /
+    // 锚点行：丢失代价高，全留
+    const ANCHOR = [
+      /\[exit code: [1-9]/,                 // 非零退出码
+      /^\s*(?:Error|error|ERROR)\b/,        // 错误
+      /\b(?:ENOENT|EACCES|EPERM|EADDRINUSE|ETIMEDOUT)\b/,
+      /\b(?:SyntaxError|TypeError|ReferenceError|RangeError|AssertionError)\b/,
+      /\bTS\d{4}\b/,                        // TypeScript 诊断码
+      /[A-Za-z]:\\|(?:^|[\s(])~?\/[\w./-]+/,  // Windows / POSIX 路径
+      /\.(?:js|mjs|cjs|ts|tsx|jsx|json|md|py|gd|yaml|yml|toml|txt|cfg|ini|sh)\b/,
+      /^\s*(?:PASS|FAIL|PASSED|FAILED|OK|SUCCESS|✔|✖|✓|✗)\b/i,
+      /\b(?:not found|failed|失败|无法|不存在)\b/i,
+    ]
+    const isAnchor = (line) => keepAnchors && ANCHOR.some((re) => re.test(line))
+
+    const n = lines2.length
+    const keep = new Array(n).fill(false)
+    for (let i = 0; i < Math.min(headLines, n); i++) keep[i] = true
+    for (let i = Math.max(0, n - tailLines); i < n; i++) keep[i] = true
+
+    // 行号区抽稀：连续行号段落里每 numStep 行留一行
+    let numRun = 0
+    for (let i = 0; i < n; i++) {
+      const m = NUM.exec(lines2[i])
+      if (m) {
+        if (numRun % numStep === 0) keep[i] = true
+        numRun++
+      } else {
+        numRun = 0
+        if (isAnchor(lines2[i])) keep[i] = true
+      }
+    }
+    // 锚点行永远覆盖上面的抽稀判断（错误行若恰好落在非抽样位也要留）
+    if (keepAnchors) for (let i = 0; i < n; i++) if (isAnchor(lines2[i])) keep[i] = true
+
+    let out = ''
+    let omitted = 0
+    const flush = () => {
+      if (omitted > 0) { out += `…（省略 ${omitted} 行）…\n`; omitted = 0 }
+    }
+    for (let i = 0; i < n; i++) {
+      if (keep[i]) { flush(); out += lines2[i] + '\n' } else omitted++
+    }
+    flush()
+
+    // 撑大是净亏：瘦身后反而更长就退回原文（与 extract 的同一条判据）
+    // 注意：比较基准是**原文** t，而不是就地截短后的 working。
+    return out.length < t.length ? out : t
   },
 
   // ────────────────────────────────────────────────────────────────────────────────
@@ -914,6 +1024,20 @@ export function createProxyAdapter({ llm, upstream, policy, getPolicy, ctx, shou
     for (const m of messages ?? []) {
       for (const b of m?.content ?? []) {
         if (typeof b === 'string') { chars += b.length; continue }
+        /**
+         * tool-result 的正文**嵌在 b.content 里**（形如
+         * `{type:'tool-result', content:[{type:'text', text:…}]}`），
+         * 不在 `b.text` 上。旧版只算 `b.text`/`b.arguments` ⇒ 塑形 toolResult 时
+         * before===after，`proxy-shape` 日志不显示、甚至整条跳过统计
+         * ⇒ **工具输出压缩在日志里完全不可观测**（本机实测踩到：
+         * skim 已生效省 37%，日志却一直是 −35% 的 reasoning 数字）。
+         */
+        if (Array.isArray(b?.content)) {
+          for (const p of b.content) {
+            if (typeof p === 'string') chars += p.length
+            else if (typeof p?.text === 'string') chars += p.text.length
+          }
+        }
         if (typeof b?.text === 'string') chars += b.text.length
         else if (typeof b?.arguments === 'string') chars += b.arguments.length
       }
